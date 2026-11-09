@@ -1,0 +1,672 @@
+package com.repolens.app.ui
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.util.TypedValue
+import android.view.GestureDetector
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.View
+import android.widget.OverScroller
+import com.repolens.app.core.LexedLine
+import com.repolens.app.core.TokenType
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/**
+ * A read-only code viewer drawn straight onto a Canvas, so files with tens of thousands of lines
+ * scroll smoothly. Lines are never wrapped unless [wrap] is on: long lines scroll sideways while
+ * the line-number gutter stays put.
+ *
+ * Rows are either code (one line, or one segment of a wrapped line) or a "lens" — the small
+ * "N references" link drawn above a definition, like CodeLens in VS Code.
+ */
+class CodeView(context: Context) : View(context) {
+
+    interface Listener {
+        fun onWordTapped(line: Int, col: Int, word: String)
+        fun onLensTapped(line: Int)
+        fun onBlankTapped()
+        fun onTextSizeChanged(sp: Float)
+    }
+
+    var listener: Listener? = null
+
+    /** True while a word the user tapped is selected (as opposed to a highlight left by navigation). */
+    var userSelection = false
+        private set
+
+    /** Id of the last navigation request applied, so each one runs exactly once. */
+    var lastRequestId = -1L
+
+    // ---------- content ----------
+    private var lines: List<LexedLine> = emptyList()
+    private var asciiLine = BooleanArray(0)
+    private var lenses: Map<Int, String> = emptyMap()
+    private var maxCols = 0
+
+    // ---------- rows ----------
+    private var rowCount = 0
+    private var rowLine = IntArray(0)
+    private var rowStart = IntArray(0)   // first column of this segment (wrap), or -1 for a lens row
+    private var rowEnd = IntArray(0)
+    private var rowTop = FloatArray(0)
+    private var firstRowOfLine = IntArray(0)
+    private var contentHeight = 0f
+
+    // ---------- appearance ----------
+    private val density = resources.displayMetrics.density
+    var textSizeSp = 11f
+        private set
+    var wrap = false
+        private set
+
+    private val codePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = Typeface.MONOSPACE }
+    private val italicFace = Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
+    private val gutterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE; textAlign = Paint.Align.RIGHT }
+    private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT }
+    private val fill = Paint()
+    private val rect = RectF()
+
+    private var charW = 0f
+    private var lineH = 0f
+    private var lensH = 0f
+    private var baseline = 0f
+    private var lensBaseline = 0f
+    private var gutterW = 0f
+    private var padL = 0f
+    private var padR = 0f
+    private var bottomPad = 0f
+
+    // ---------- scrolling ----------
+    private var sx = 0f
+    private var sy = 0f
+    private val scroller = OverScroller(context)
+    private var lockAxis = 0 // 0 undecided, 1 horizontal, 2 vertical, 3 free
+    private var scaling = false
+    private var pendingReveal: IntArray? = null
+    private var pendingTopLine = -1
+
+    // ---------- selection / highlight ----------
+    private var selLine = -1
+    private var selStart = 0
+    private var selEnd = 0
+    private var highlightWord: String? = null
+    private var flashLine = -1
+    private var flashStart = 0L
+
+    init {
+        isFocusable = true
+        applyTextSize(textSizeSp)
+    }
+
+    // ================= public API =================
+
+    fun setContent(newLines: List<LexedLine>, newLenses: Map<Int, String>, wrapLines: Boolean) {
+        if (newLines === lines && newLenses === lenses && wrapLines == wrap) return
+        val sameDoc = newLines === lines
+        val topLine = if (sameDoc) firstVisibleLine() else -1
+        val topOffset = if (sameDoc && topLine >= 0) sy - rowTop.getOrElse(firstRowOfLine.getOrElse(topLine) { 0 }) { 0f } else 0f
+        lines = newLines
+        lenses = newLenses
+        wrap = wrapLines
+        if (!sameDoc) {
+            asciiLine = BooleanArray(lines.size) { i -> lines[i].text.all { it.code < 128 } }
+            maxCols = lines.maxOfOrNull { it.text.length } ?: 0
+            sx = 0f; sy = 0f
+            scroller.forceFinished(true)
+            clearSelection()
+            computeGutter()
+        }
+        rebuildRows()
+        if (sameDoc && topLine >= 0 && topLine < firstRowOfLine.size) {
+            sy = rowTop[firstRowOfLine[topLine]] + topOffset
+            clampScroll()
+        }
+        invalidate()
+    }
+
+    fun setTextSize(sp: Float) {
+        if (abs(sp - textSizeSp) < 0.01f) return
+        val top = firstVisibleLine()
+        applyTextSize(sp)
+        rebuildRows()
+        if (top >= 0 && top < firstRowOfLine.size) sy = rowTop[firstRowOfLine[top]]
+        clampScroll()
+        invalidate()
+    }
+
+    /** Text size at which ~90% of this file's lines fit the screen width without scrolling. */
+    fun fitTextSize(): Float {
+        if (lines.isEmpty() || width == 0) return textSizeSp
+        val lengths = lines.map { it.text.trimEnd().length }.filter { it > 0 }.sorted()
+        if (lengths.isEmpty()) return textSizeSp
+        val p90 = lengths[(lengths.size * 0.9).toInt().coerceAtMost(lengths.size - 1)].coerceAtLeast(40)
+        val available = width - gutterW - padL - padR
+        val perCharPx = available / p90
+        // charW is proportional to text size
+        val sp = textSizeSp * (perCharPx / charW)
+        return sp.coerceIn(MIN_SP, 14f)
+    }
+
+    fun select(line: Int, start: Int, end: Int, word: String?) {
+        selLine = line; selStart = start; selEnd = end; highlightWord = word
+        invalidate()
+    }
+
+    fun clearSelection() {
+        selLine = -1; highlightWord = null; userSelection = false
+        invalidate()
+    }
+
+    /** Scrolls so [line] is in the upper third of the screen and flashes it. */
+    fun reveal(line: Int, col: Int, length: Int) {
+        if (height == 0 || rowCount == 0) { pendingReveal = intArrayOf(line, col, length); return }
+        val l = line.coerceIn(0, max(0, lines.size - 1))
+        var r = firstRowOfLine.getOrElse(l) { 0 }
+        if (wrap) {
+            while (r + 1 < rowCount && rowLine[r + 1] == l && rowStart[r + 1] >= 0 && rowStart[r + 1] <= col) r++
+        }
+        if (r > 0 && rowStart[r - 1] < 0) r-- // keep the lens above the definition visible
+        scroller.forceFinished(true)
+        sy = rowTop[r] - height * 0.28f
+        if (!wrap && l < lines.size) {
+            val x = xOfCol(l, col)
+            val viewW = width - gutterW
+            if (x - sx < 0 || x + length * charW - sx > viewW - padR) sx = max(0f, x - viewW * 0.25f)
+        }
+        clampScroll()
+        flashLine = l
+        flashStart = System.currentTimeMillis()
+        if (length > 0) select(l, col, col + length, lines.getOrNull(l)?.text?.let { t -> if (col + length <= t.length) t.substring(col, col + length) else null })
+        userSelection = false
+        invalidate()
+    }
+
+    fun firstVisibleLine(): Int {
+        if (rowCount == 0) return -1
+        val r = rowAt(sy)
+        for (k in r until rowCount) if (rowStart[k] >= 0) return rowLine[k]
+        return rowLine[r]
+    }
+
+    fun scrollToTopLine(line: Int) {
+        if (height == 0 || rowCount == 0) { pendingTopLine = line; return }
+        val l = line.coerceIn(0, max(0, lines.size - 1))
+        sy = rowTop[firstRowOfLine.getOrElse(l) { 0 }]
+        clampScroll(); invalidate()
+    }
+
+    /** Screen position of the middle of [line]:[col] (unwrapped), for tests. */
+    fun pointFor(line: Int, col: Int): android.graphics.PointF {
+        val r = firstRowOfLine[line]
+        return android.graphics.PointF(gutterW + padL - sx + xOfCol(line, col) + charW / 2, rowTop[r] - sy + lineH / 2)
+    }
+
+    /** Screen position of the lens above [line], for tests. */
+    fun lensPointFor(line: Int): android.graphics.PointF {
+        val r = firstRowOfLine[line] - 1
+        val text = lines[line].text
+        val indent = text.length - text.trimStart().length
+        return android.graphics.PointF(gutterW + padL - sx + xOfCol(line, indent) + charW * 2, rowTop[r] - sy + lensH / 2)
+    }
+
+    // ================= layout =================
+
+    private fun applyTextSize(sp: Float) {
+        textSizeSp = sp.coerceIn(MIN_SP, MAX_SP)
+        val px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, textSizeSp, resources.displayMetrics)
+        codePaint.textSize = px
+        charW = codePaint.measureText("M")
+        val fm = codePaint.fontMetrics
+        val textH = fm.descent - fm.ascent
+        lineH = (textH * 1.32f).roundToInt().toFloat()
+        baseline = (lineH - textH) / 2f - fm.ascent
+
+        lensPaint.textSize = px * 0.8f
+        val lfm = lensPaint.fontMetrics
+        val lensTextH = lfm.descent - lfm.ascent
+        lensH = (lensTextH * 1.25f).roundToInt().toFloat()
+        lensBaseline = (lensH - lensTextH) / 2f - lfm.ascent + lensH * 0.08f
+
+        gutterPaint.textSize = px * 0.88f
+        padL = charW * 0.9f
+        padR = charW * 3f
+        bottomPad = 160 * density
+        computeGutter()
+    }
+
+    private fun computeGutter() {
+        val digits = max(2, lines.size.toString().length)
+        gutterW = gutterPaint.measureText("0") * (digits + 1.6f)
+    }
+
+    private fun wrapCols(): Int {
+        val w = width - gutterW - padL - padR * 0.4f
+        return if (w <= 0 || charW <= 0) 80 else max(20, (w / charW).toInt())
+    }
+
+    private fun rebuildRows() {
+        val n = lines.size
+        val cols = if (wrap) wrapCols() else Int.MAX_VALUE
+        var cap = n + lenses.size + 8
+        var line = IntArray(cap); var start = IntArray(cap); var end = IntArray(cap)
+        firstRowOfLine = IntArray(n)
+        var count = 0
+        fun add(l: Int, s: Int, e: Int) {
+            if (count == cap) {
+                cap *= 2
+                line = line.copyOf(cap); start = start.copyOf(cap); end = end.copyOf(cap)
+            }
+            line[count] = l; start[count] = s; end[count] = e; count++
+        }
+        for (i in 0 until n) {
+            if (lenses.containsKey(i)) add(i, -1, -1)
+            firstRowOfLine[i] = count
+            val len = lines[i].text.length
+            if (!wrap || len <= cols) { add(i, 0, len); continue }
+            var s = 0
+            val text = lines[i].text
+            while (s < len) {
+                var e = min(len, s + cols)
+                if (e < len) {
+                    // break after the last space/punctuation in the final quarter of the segment
+                    var k = e
+                    while (k > s + cols * 3 / 4 && !text[k - 1].isWhitespace() && text[k - 1] !in ",;(){}[]") k--
+                    if (k > s + cols * 3 / 4) e = k
+                }
+                add(i, s, e)
+                s = e
+            }
+        }
+        rowCount = count
+        rowLine = line; rowStart = start; rowEnd = end
+        rowTop = FloatArray(count + 1)
+        var y = 0f
+        for (r in 0 until count) {
+            rowTop[r] = y
+            y += if (start[r] < 0) lensH else lineH
+        }
+        rowTop[count] = y
+        contentHeight = y
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (wrap && w != oldw) {
+            val top = firstVisibleLine()
+            rebuildRows()
+            if (top >= 0) sy = rowTop[firstRowOfLine[top]]
+        }
+        clampScroll()
+        pendingReveal?.let { pendingReveal = null; post { reveal(it[0], it[1], it[2]) } }
+        if (pendingTopLine >= 0) { val l = pendingTopLine; pendingTopLine = -1; post { scrollToTopLine(l) } }
+    }
+
+    private fun maxScrollX(): Float =
+        if (wrap) 0f else max(0f, gutterW + padL + maxCols * charW + padR - width)
+
+    private fun maxScrollY(): Float = max(0f, contentHeight + bottomPad - height)
+
+    private fun clampScroll() {
+        sx = sx.coerceIn(0f, maxScrollX())
+        sy = sy.coerceIn(0f, maxScrollY())
+    }
+
+    private fun rowAt(y: Float): Int {
+        if (rowCount == 0) return 0
+        var lo = 0
+        var hi = rowCount - 1
+        while (lo < hi) {
+            val mid = (lo + hi + 1) ushr 1
+            if (rowTop[mid] <= y) lo = mid else hi = mid - 1
+        }
+        return lo
+    }
+
+    private fun xOfCol(line: Int, col: Int): Float {
+        val text = lines[line].text
+        val c = col.coerceIn(0, text.length)
+        return if (asciiLine[line]) c * charW else codePaint.measureText(text, 0, c)
+    }
+
+    private fun colAtX(line: Int, x: Float): Int {
+        val text = lines[line].text
+        if (asciiLine[line]) return (x / charW).toInt().coerceIn(0, text.length)
+        var acc = 0f
+        for (i in text.indices) {
+            val w = codePaint.measureText(text, i, i + 1)
+            if (acc + w / 2 > x) return i
+            acc += w
+        }
+        return text.length
+    }
+
+    // ================= drawing =================
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawColor(Palette.BG)
+        if (rowCount == 0) return
+        val h = height
+        val first = rowAt(sy)
+        val codeLeft = gutterW
+        val now = System.currentTimeMillis()
+        val flashAlpha = if (flashLine >= 0) (1f - (now - flashStart) / FLASH_MS.toFloat()).coerceIn(0f, 1f) else 0f
+
+        canvas.save()
+        canvas.clipRect(codeLeft, 0f, width.toFloat(), h.toFloat())
+        var r = first
+        while (r < rowCount && rowTop[r] - sy < h) {
+            val top = rowTop[r] - sy
+            val line = rowLine[r]
+            if (rowStart[r] < 0) {
+                drawLens(canvas, line, top)
+            } else {
+                if (flashAlpha > 0f && line == flashLine) {
+                    fill.color = Palette.FLASH; fill.alpha = (flashAlpha * 255).toInt()
+                    canvas.drawRect(codeLeft, top, width.toFloat(), top + lineH, fill)
+                }
+                drawCodeRow(canvas, r, line, top)
+            }
+            r++
+        }
+        canvas.restore()
+
+        // gutter
+        fill.color = Palette.GUTTER_BG; fill.alpha = 255
+        canvas.drawRect(0f, 0f, gutterW, h.toFloat(), fill)
+        fill.color = Palette.GUTTER_LINE
+        canvas.drawRect(gutterW - density, 0f, gutterW, h.toFloat(), fill)
+        r = first
+        val numX = gutterW - gutterPaint.measureText("0") * 0.7f
+        while (r < rowCount && rowTop[r] - sy < h) {
+            if (rowStart[r] == 0) {
+                val line = rowLine[r]
+                gutterPaint.color = if (line == selLine || line == flashLine && flashAlpha > 0) Palette.LINE_NO_ACTIVE else Palette.LINE_NO
+                canvas.drawText((line + 1).toString(), numX, rowTop[r] - sy + baseline, gutterPaint)
+            }
+            r++
+        }
+
+        drawScrollbars(canvas)
+        if (flashAlpha > 0f) postInvalidateOnAnimation() else flashLine = -1
+    }
+
+    private fun drawLens(canvas: Canvas, line: Int, top: Float) {
+        val label = lenses[line] ?: return
+        val text = lines[line].text
+        val indent = text.length - text.trimStart().length
+        val x = gutterW + padL - sx + xOfCol(line, indent)
+        lensPaint.color = Palette.LENS
+        canvas.drawText(label, x, top + lensBaseline, lensPaint)
+    }
+
+    private fun drawCodeRow(canvas: Canvas, r: Int, line: Int, top: Float) {
+        val lexed = lines[line]
+        val text = lexed.text
+        val segStart = rowStart[r]
+        val segEnd = rowEnd[r]
+        // x of column c on screen
+        val ascii = asciiLine[line]
+        val segX = if (wrap) xOfCol(line, segStart) else 0f
+        val baseX = gutterW + padL - sx - segX
+        val y = top + baseline
+
+        var visStart = segStart
+        var visEnd = segEnd
+        if (ascii && !wrap) {
+            visStart = max(segStart, ((sx - padL) / charW).toInt() - 1)
+            visEnd = min(segEnd, ((sx + width) / charW).toInt() + 2)
+            if (visStart >= visEnd) return
+        }
+
+        // occurrence highlights of the selected word
+        val hw = highlightWord
+        if (hw != null) {
+            for (i in 0 until lexed.tokenCount) {
+                val s = lexed.start(i); val e = lexed.end(i)
+                if (e <= visStart) continue
+                if (s >= visEnd) break
+                if (e - s == hw.length && TokenType.isIdentifier(lexed.type(i)) && text.regionMatches(s, hw, 0, hw.length)) {
+                    val sel = line == selLine && s == selStart
+                    fill.color = if (sel) Palette.SELECTION else Palette.OCCURRENCE; fill.alpha = 255
+                    rect.set(baseX + xOfCol(line, s) - 1, top + 1, baseX + xOfCol(line, e) + 1, top + lineH - 1)
+                    canvas.drawRoundRect(rect, 3 * density, 3 * density, fill)
+                }
+            }
+        } else if (line == selLine && selEnd > segStart && selStart < segEnd) {
+            fill.color = Palette.SELECTION; fill.alpha = 255
+            rect.set(baseX + xOfCol(line, selStart) - 1, top + 1, baseX + xOfCol(line, selEnd) + 1, top + lineH - 1)
+            canvas.drawRoundRect(rect, 3 * density, 3 * density, fill)
+        }
+
+        var pos = visStart
+        for (i in 0 until lexed.tokenCount) {
+            val ts = lexed.start(i); val te = lexed.end(i)
+            if (te <= visStart) continue
+            if (ts >= visEnd) break
+            val s = max(ts, visStart); val e = min(te, visEnd)
+            if (s > pos) drawRun(canvas, text, line, pos, s, baseX, y, Palette.TEXT, false)
+            val type = lexed.type(i)
+            drawRun(canvas, text, line, s, e, baseX, y, Palette.colorOf(type), type == TokenType.COMMENT)
+            pos = e
+        }
+        if (pos < visEnd) drawRun(canvas, text, line, pos, visEnd, baseX, y, Palette.TEXT, false)
+
+        if (wrap && segStart > 0) {
+            // continuation marker in the left padding
+            lensPaint.color = Palette.LINE_NO
+            canvas.drawText("↪", gutterW + padL * 0.1f, y, lensPaint)
+        }
+    }
+
+    private fun drawRun(canvas: Canvas, text: String, line: Int, s: Int, e: Int, baseX: Float, y: Float, color: Int, italic: Boolean) {
+        if (e <= s) return
+        // skip pure whitespace
+        var k = s
+        while (k < e && text[k] == ' ') k++
+        if (k == e) return
+        codePaint.color = color
+        codePaint.typeface = if (italic) italicFace else Typeface.MONOSPACE
+        canvas.drawText(text, k, e, baseX + xOfCol(line, k), y, codePaint)
+    }
+
+    private fun drawScrollbars(canvas: Canvas) {
+        val viewH = height.toFloat()
+        val total = contentHeight + bottomPad
+        if (total > viewH * 1.05f) {
+            val thumbH = max(32 * density, viewH * viewH / total)
+            val t = sy / max(1f, maxScrollY()) * (viewH - thumbH)
+            fill.color = Palette.SCROLLBAR; fill.alpha = 255
+            rect.set(width - 4 * density, t, width - 1.5f * density, t + thumbH)
+            canvas.drawRoundRect(rect, 2 * density, 2 * density, fill)
+        }
+        val maxX = maxScrollX()
+        if (maxX > 0) {
+            val viewW = width - gutterW
+            val contentW = viewW + maxX
+            val thumbW = max(32 * density, viewW * viewW / contentW)
+            val l = gutterW + sx / maxX * (viewW - thumbW)
+            fill.color = Palette.SCROLLBAR
+            rect.set(l, viewH - 4 * density, l + thumbW, viewH - 1.5f * density)
+            canvas.drawRoundRect(rect, 2 * density, 2 * density, fill)
+        }
+    }
+
+    // ================= touch =================
+
+    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(e: MotionEvent): Boolean {
+            scroller.forceFinished(true)
+            lockAxis = 0
+            return true
+        }
+
+        override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
+            if (scaling) return true
+            if (lockAxis == 0) {
+                val tx = abs(e2.x - (e1?.x ?: e2.x)); val ty = abs(e2.y - (e1?.y ?: e2.y))
+                lockAxis = when {
+                    maxScrollX() == 0f -> 2
+                    ty > tx * 1.6f -> 2
+                    tx > ty * 1.6f -> 1
+                    else -> 3
+                }
+            }
+            if (lockAxis != 2) sx += dx
+            if (lockAxis != 1) sy += dy
+            clampScroll()
+            invalidate()
+            return true
+        }
+
+        override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+            if (scaling) return true
+            val fx = if (lockAxis == 2) 0 else -vx.toInt()
+            val fy = if (lockAxis == 1) 0 else -vy.toInt()
+            scroller.fling(sx.toInt(), sy.toInt(), fx, fy, 0, maxScrollX().toInt(), 0, maxScrollY().toInt())
+            postInvalidateOnAnimation()
+            return true
+        }
+
+        override fun onSingleTapUp(e: MotionEvent): Boolean {
+            handleTap(e.x, e.y)
+            return true
+        }
+
+        override fun onLongPress(e: MotionEvent) {
+            if (!scaling) handleTap(e.x, e.y)
+        }
+    })
+
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            scaling = true
+            scroller.forceFinished(true)
+            return true
+        }
+
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val newSp = (textSizeSp * detector.scaleFactor).coerceIn(MIN_SP, MAX_SP)
+            if (abs(newSp - textSizeSp) < 0.05f) return false
+            val fx = detector.focusX; val fy = detector.focusY
+            val oldLineH = lineH; val oldCharW = charW; val oldGutter = gutterW
+            val contentY = sy + fy
+            val contentX = sx + fx - oldGutter
+            applyTextSize(newSp)
+            rebuildRows()
+            sy = contentY * (lineH / oldLineH) - fy
+            sx = contentX * (charW / oldCharW) - (fx - gutterW)
+            clampScroll()
+            invalidate()
+            return true
+        }
+
+        override fun onScaleEnd(detector: ScaleGestureDetector) {
+            listener?.onTextSizeChanged(textSizeSp)
+        }
+    })
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            parent?.requestDisallowInterceptTouchEvent(true)
+            scaling = false
+        }
+        scaleDetector.onTouchEvent(event)
+        if (!scaleDetector.isInProgress) gestureDetector.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            if (!scaleDetector.isInProgress) scaling = false
+        }
+        return true
+    }
+
+    override fun computeScroll() {
+        if (scroller.computeScrollOffset()) {
+            sx = scroller.currX.toFloat()
+            sy = scroller.currY.toFloat()
+            clampScroll()
+            postInvalidateOnAnimation()
+        }
+    }
+
+    private fun handleTap(x: Float, y: Float) {
+        if (rowCount == 0) return
+        val cy = y + sy
+        if (cy >= contentHeight) { listener?.onBlankTapped(); return }
+        val r = rowAt(cy)
+        val line = rowLine[r]
+        if (rowStart[r] < 0) {
+            val label = lenses[line]
+            if (label != null) {
+                val text = lines[line].text
+                val indent = text.length - text.trimStart().length
+                val lx = gutterW + padL - sx + xOfCol(line, indent)
+                if (x >= lx - 12 * density && x <= lx + lensPaint.measureText(label) + 16 * density) {
+                    listener?.onLensTapped(line); return
+                }
+            }
+            listener?.onBlankTapped(); return
+        }
+        if (x < gutterW) { listener?.onBlankTapped(); return }
+        val segX = if (wrap) xOfCol(line, rowStart[r]) else 0f
+        val contentX = x - gutterW - padL + sx + segX
+        val col = colAtX(line, contentX)
+        val lexed = lines[line]
+        // be forgiving: a fingertip is wider than a character
+        var tok = lexed.identifierAt(col)
+        if (tok < 0 && col > 0) tok = lexed.identifierAt(col - 1)
+        if (tok < 0) tok = lexed.identifierAt(col + 1)
+        if (tok < 0) { listener?.onBlankTapped(); return }
+        val s = lexed.start(tok); val e = lexed.end(tok)
+        val word = lexed.text.substring(s, e)
+        select(line, s, e, word)
+        userSelection = true
+        listener?.onWordTapped(line, s, word)
+    }
+
+    companion object {
+        const val MIN_SP = 6f
+        const val MAX_SP = 30f
+        private const val FLASH_MS = 1400L
+    }
+}
+
+/** Dark editor colours. */
+object Palette {
+    const val BG = 0xFF1B1D23.toInt()
+    const val GUTTER_BG = 0xFF1B1D23.toInt()
+    const val GUTTER_LINE = 0xFF2A2E36.toInt()
+    const val LINE_NO = 0xFF4B5263.toInt()
+    const val LINE_NO_ACTIVE = 0xFFABB2BF.toInt()
+    const val TEXT = 0xFFC8CDD5.toInt()
+    const val KEYWORD = 0xFFC678DD.toInt()
+    const val TYPE = 0xFFE5C07B.toInt()
+    const val FUNCTION = 0xFF61AFEF.toInt()
+    const val STRING = 0xFF98C379.toInt()
+    const val NUMBER = 0xFFD19A66.toInt()
+    const val COMMENT = 0xFF7F848E.toInt()
+    const val ANNOTATION = 0xFFE06C75.toInt()
+    const val IDENT = 0xFFD7DAE0.toInt()
+    const val SELECTION = 0xFF3E4F6E.toInt()
+    const val OCCURRENCE = 0xFF333A47.toInt()
+    const val FLASH = 0xFF2F3A4F.toInt()
+    const val LENS = 0xFF8A94A6.toInt()
+    const val SCROLLBAR = 0x55FFFFFF
+
+    fun colorOf(type: Int) = when (type) {
+        TokenType.KEYWORD -> KEYWORD
+        TokenType.TYPE -> TYPE
+        TokenType.FUNCTION -> FUNCTION
+        TokenType.STRING -> STRING
+        TokenType.NUMBER -> NUMBER
+        TokenType.COMMENT -> COMMENT
+        TokenType.ANNOTATION -> ANNOTATION
+        TokenType.IDENT -> IDENT
+        else -> TEXT
+    }
+}
