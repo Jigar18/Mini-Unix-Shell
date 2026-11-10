@@ -67,6 +67,16 @@ class CodeView(context: Context) : View(context) {
         private set
 
     private val codePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = Typeface.MONOSPACE }
+    /** Always upright monospace, so measurements don't depend on what was drawn last. */
+    private val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = Typeface.MONOSPACE }
+
+    /**
+     * x offset of every column of recently drawn non-ASCII lines (emoji, CJK, combining marks…),
+     * so drawing and hit-testing them is O(log n) instead of measuring the line again and again.
+     */
+    private val prefixCache = object : LinkedHashMap<Int, FloatArray>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, FloatArray>?) = size > 256
+    }
     private val italicFace = Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
     private val gutterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE; textAlign = Paint.Align.RIGHT }
     private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT }
@@ -116,6 +126,7 @@ class CodeView(context: Context) : View(context) {
         lenses = newLenses
         wrap = wrapLines
         if (!sameDoc) {
+            prefixCache.clear()
             asciiLine = BooleanArray(lines.size) { i -> lines[i].text.all { it.code < 128 } }
             maxCols = lines.maxOfOrNull { it.text.length } ?: 0
             sx = 0f; sy = 0f
@@ -132,7 +143,7 @@ class CodeView(context: Context) : View(context) {
     }
 
     fun setTextSize(sp: Float) {
-        if (abs(sp - textSizeSp) < 0.01f) return
+        if (sp.isNaN() || abs(sp - textSizeSp) < 0.01f) return
         val top = firstVisibleLine()
         applyTextSize(sp)
         rebuildRows()
@@ -168,6 +179,10 @@ class CodeView(context: Context) : View(context) {
     fun reveal(line: Int, col: Int, length: Int) {
         if (height == 0 || rowCount == 0) { pendingReveal = intArrayOf(line, col, length); return }
         val l = line.coerceIn(0, max(0, lines.size - 1))
+        // a stale location (file changed, restored history…) may point past the text
+        val lineLen = lines.getOrNull(l)?.text?.length ?: 0
+        val col = col.coerceIn(0, lineLen)
+        val length = length.coerceIn(0, lineLen - col)
         var r = firstRowOfLine.getOrElse(l) { 0 }
         if (wrap) {
             while (r + 1 < rowCount && rowLine[r + 1] == l && rowStart[r + 1] >= 0 && rowStart[r + 1] <= col) r++
@@ -204,12 +219,14 @@ class CodeView(context: Context) : View(context) {
 
     /** Screen position of the middle of [line]:[col] (unwrapped), for tests. */
     fun pointFor(line: Int, col: Int): android.graphics.PointF {
+        if (line !in lines.indices) return android.graphics.PointF(-1f, -1f)
         val r = firstRowOfLine[line]
         return android.graphics.PointF(gutterW + padL - sx + xOfCol(line, col) + charW / 2, rowTop[r] - sy + lineH / 2)
     }
 
     /** Screen position of the lens above [line], for tests. */
     fun lensPointFor(line: Int): android.graphics.PointF {
+        if (line !in lines.indices || firstRowOfLine[line] == 0) return android.graphics.PointF(-1f, -1f)
         val r = firstRowOfLine[line] - 1
         val text = lines[line].text
         val indent = text.length - text.trimStart().length
@@ -219,10 +236,12 @@ class CodeView(context: Context) : View(context) {
     // ================= layout =================
 
     private fun applyTextSize(sp: Float) {
-        textSizeSp = sp.coerceIn(MIN_SP, MAX_SP)
+        textSizeSp = if (sp.isNaN()) 11f else sp.coerceIn(MIN_SP, MAX_SP)
         val px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, textSizeSp, resources.displayMetrics)
         codePaint.textSize = px
-        charW = codePaint.measureText("M")
+        measurePaint.textSize = px
+        prefixCache.clear()
+        charW = codePaint.measureText("M").takeIf { it > 0f } ?: (px * 0.6f).coerceAtLeast(1f)
         val fm = codePaint.fontMetrics
         val textH = fm.descent - fm.ascent
         lineH = (textH * 1.32f).roundToInt().toFloat()
@@ -329,22 +348,33 @@ class CodeView(context: Context) : View(context) {
         return lo
     }
 
+    private fun prefix(line: Int): FloatArray = prefixCache.getOrPut(line) {
+        val text = lines[line].text
+        val widths = FloatArray(text.length)
+        if (text.isNotEmpty()) measurePaint.getTextWidths(text, 0, text.length, widths)
+        val p = FloatArray(text.length + 1)
+        for (i in widths.indices) p[i + 1] = p[i] + widths[i].coerceAtLeast(0f)
+        p
+    }
+
     private fun xOfCol(line: Int, col: Int): Float {
         val text = lines[line].text
         val c = col.coerceIn(0, text.length)
-        return if (asciiLine[line]) c * charW else codePaint.measureText(text, 0, c)
+        return if (asciiLine[line]) c * charW else prefix(line)[c]
     }
 
     private fun colAtX(line: Int, x: Float): Int {
         val text = lines[line].text
         if (asciiLine[line]) return (x / charW).toInt().coerceIn(0, text.length)
-        var acc = 0f
-        for (i in text.indices) {
-            val w = codePaint.measureText(text, i, i + 1)
-            if (acc + w / 2 > x) return i
-            acc += w
+        val p = prefix(line)
+        // first column whose middle is right of x
+        var lo = 0
+        var hi = text.length
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if ((p[mid] + p[mid + 1]) / 2 > x) hi = mid else lo = mid + 1
         }
-        return text.length
+        return lo
     }
 
     // ================= drawing =================
@@ -422,6 +452,11 @@ class CodeView(context: Context) : View(context) {
         if (ascii && !wrap) {
             visStart = max(segStart, ((sx - padL) / charW).toInt() - 1)
             visEnd = min(segEnd, ((sx + width) / charW).toInt() + 2)
+            if (visStart >= visEnd) return
+        } else if (!wrap && segEnd - segStart > 256) {
+            // long non-ASCII line: only draw the part that is on screen
+            visStart = max(segStart, colAtX(line, sx - padL) - 2)
+            visEnd = min(segEnd, colAtX(line, sx + width) + 2)
             if (visStart >= visEnd) return
         }
 
@@ -556,6 +591,7 @@ class CodeView(context: Context) : View(context) {
             if (abs(newSp - textSizeSp) < 0.05f) return false
             val fx = detector.focusX; val fy = detector.focusY
             val oldLineH = lineH; val oldCharW = charW; val oldGutter = gutterW
+            if (oldLineH <= 0f || oldCharW <= 0f || newSp.isNaN()) return false
             val contentY = sy + fy
             val contentX = sx + fx - oldGutter
             applyTextSize(newSp)

@@ -49,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -134,6 +135,7 @@ fun HomeScreen(vm: AppViewModel) {
                         }
                     }
                 }
+                vm.crashReport?.let { report -> CrashReportCard(report, onCopy = { clipboard.setText(AnnotatedString(report)) }, onDismiss = { vm.dismissCrashReport() }) }
                 vm.error?.let {
                     Spacer(Modifier.height(16.dp))
                     Surface(color = UiColors.Error.copy(alpha = 0.12f), shape = RoundedCornerShape(12.dp)) {
@@ -166,6 +168,32 @@ fun HomeScreen(vm: AppViewModel) {
     }
 }
 
+/** Shown after a crash so the user can send us the stack trace. Deliberately plain. */
+@Composable
+private fun CrashReportCard(report: String, onCopy: () -> Unit, onDismiss: () -> Unit) {
+    var copied by remember { mutableStateOf(false) }
+    Spacer(Modifier.height(16.dp))
+    Surface(color = UiColors.SurfaceHigh, shape = RoundedCornerShape(12.dp)) {
+        Column(Modifier.fillMaxWidth().padding(14.dp)) {
+            Text("RepoLens crashed last time", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Copy the report and paste it into an issue so it can be fixed.",
+                color = UiColors.Muted, fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                report.lineSequence().filter { it.isNotBlank() }.take(8).joinToString("\n"),
+                fontFamily = Mono, fontSize = 11.sp, color = UiColors.Muted, maxLines = 8, overflow = TextOverflow.Ellipsis,
+            )
+            Row {
+                TextButton(onClick = { onCopy(); copied = true }) { Text(if (copied) "Copied" else "Copy") }
+                TextButton(onClick = onDismiss) { Text("Dismiss") }
+            }
+        }
+    }
+}
+
 @Composable
 private fun RecentRow(vm: AppViewModel, r: RecentRepo, enabled: Boolean) {
     var menu by remember { mutableStateOf(false) }
@@ -182,7 +210,7 @@ private fun RecentRow(vm: AppViewModel, r: RecentRepo, enabled: Boolean) {
         Column(Modifier.weight(1f)) {
             Text(r.fullName, fontFamily = Mono, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                "${r.branch} · ${RepoDownloader.formatBytes(r.bytes)} · ${DateUtils.getRelativeTimeSpanString(r.openedAt)}",
+                "${r.branch} · ${RepoDownloader.formatBytes(r.bytes)}" + (if (r.openedAt > 0) " · ${DateUtils.getRelativeTimeSpanString(r.openedAt)}" else ""),
                 color = UiColors.Muted, fontSize = 12.sp, maxLines = 1,
             )
         }

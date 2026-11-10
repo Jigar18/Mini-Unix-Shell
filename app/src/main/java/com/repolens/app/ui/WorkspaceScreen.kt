@@ -116,6 +116,7 @@ import com.repolens.app.RefFile
 import com.repolens.app.RefItem
 import com.repolens.app.WordSelection
 import com.repolens.app.Workspace
+import com.repolens.app.core.LexedLine
 import com.repolens.app.core.RepoDownloader
 import com.repolens.app.core.Symbol
 import com.repolens.app.core.SymbolKind
@@ -172,10 +173,13 @@ fun WorkspaceScreen(vm: AppViewModel, ws: Workspace) {
                 Column(Modifier.fillMaxSize()) {
                     IndexingStrip(ws)
                     val doc = ws.doc
+                    val docLines = doc?.lines
+                    val image = doc?.imageFile
+                    doc?.banner?.let { Text(it, color = UiColors.Muted, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().background(UiColors.Surface).padding(8.dp)) }
                     when {
                         doc == null -> Box(Modifier.fillMaxSize())
-                        doc.lines != null -> CodeHost(vm, ws, doc, codeView)
-                        doc.imageFile != null -> ImageDoc(doc)
+                        docLines != null -> CodeHost(vm, ws, doc, docLines, codeView)
+                        image != null -> ImageDoc(doc, image)
                         else -> Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
                             Text(doc.note.orEmpty(), color = UiColors.Muted, textAlign = TextAlign.Center)
                         }
@@ -266,14 +270,16 @@ private fun IndexingStrip(ws: Workspace) {
     ws.indexError?.let {
         Text(it, color = UiColors.Error, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().background(UiColors.Surface).padding(8.dp))
     }
+    ws.indexNote?.let {
+        Text(it, color = UiColors.Muted, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().background(UiColors.Surface).padding(8.dp))
+    }
 }
 
 // ------------------------------------------------------------------ code
 
 @Composable
-private fun CodeHost(vm: AppViewModel, ws: Workspace, doc: OpenDoc, holder: MutableState<CodeView?>) {
+private fun CodeHost(vm: AppViewModel, ws: Workspace, doc: OpenDoc, lines: List<LexedLine>, holder: MutableState<CodeView?>) {
     val wrap = vm.wrapCode || vm.isProse(doc)
-    val lines = doc.lines!!
     val lenses = ws.lenses
     val request = ws.viewRequest
     val hasSelection = ws.selection != null
@@ -305,23 +311,37 @@ private fun CodeHost(vm: AppViewModel, ws: Workspace, doc: OpenDoc, holder: Muta
 }
 
 @Composable
-private fun ImageDoc(doc: OpenDoc) {
+private fun ImageDoc(doc: OpenDoc, file: java.io.File) {
     var bmp by remember(doc.path) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(doc.path) {
-        bmp = withContext(Dispatchers.IO) {
-            val f = doc.imageFile!!
-            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(f.path, o)
-            var sample = 1
-            while (o.outWidth / sample > 2048 || o.outHeight / sample > 2048) sample *= 2
-            BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = sample })
-        }
+        bmp = withContext(Dispatchers.IO) { decodeImageSafely(file) }
     }
     Box(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
         val b = bmp
         if (b != null) Image(b.asImageBitmap(), doc.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
         else Text("Couldn't display this image.", color = UiColors.Muted)
     }
+}
+
+/**
+ * Decodes an image for display, or null if it is corrupt, empty or can't fit in memory: the
+ * bitmap is downsampled to at most 2048 px per side and ~16 MB.
+ */
+internal fun decodeImageSafely(f: java.io.File): android.graphics.Bitmap? = try {
+    val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(f.path, o)
+    if (o.outWidth <= 0 || o.outHeight <= 0) {
+        null
+    } else {
+        var sample = 1
+        while (o.outWidth / sample > 2048 || o.outHeight / sample > 2048 ||
+            (o.outWidth.toLong() / sample) * (o.outHeight.toLong() / sample) * 4 > 16L * 1024 * 1024) sample *= 2
+        BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = sample })
+    }
+} catch (e: OutOfMemoryError) {
+    null
+} catch (e: Exception) {
+    null
 }
 
 // ------------------------------------------------------------------ selection bar
@@ -357,7 +377,7 @@ private fun SelectionBar(vm: AppViewModel, ws: Workspace, modifier: Modifier) {
                 Text(describe(s), color = UiColors.Muted, fontSize = 12.5.sp, lineHeight = 17.sp, modifier = Modifier.padding(end = 10.dp))
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val others = s.definitions.count { it !== s.site }
+                    val others = s.definitions.count { it != s.site }
                     if (s.site == null) {
                         Button(onClick = { vm.goToDefinition() }, enabled = s.indexReady && others > 0) { Text("Go to definition") }
                         OutlinedButton(onClick = { vm.showReferencesForSelection() }, enabled = s.indexReady) {

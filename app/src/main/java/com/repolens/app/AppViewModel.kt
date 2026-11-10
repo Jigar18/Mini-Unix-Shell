@@ -2,18 +2,20 @@ package com.repolens.app
 
 import android.app.Application
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.repolens.app.core.Family
+import com.repolens.app.core.IndexLimits
 import com.repolens.app.core.IndexProgress
-import com.repolens.app.core.Language
 import com.repolens.app.core.Languages
-import com.repolens.app.core.LexedLine
-import com.repolens.app.core.Lexer
 import com.repolens.app.core.Occurrence
 import com.repolens.app.core.RepoDownloader
 import com.repolens.app.core.RepoException
@@ -23,27 +25,19 @@ import com.repolens.app.core.SourceText
 import com.repolens.app.core.Symbol
 import com.repolens.app.core.SymbolIndex
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 
 data class Location(val path: String, val line: Int, val col: Int = 0, val length: Int = 0)
 
 class RecentRepo(val owner: String, val repo: String, val branch: String, val openedAt: Long, val bytes: Long) {
     val fullName get() = "$owner/$repo"
-}
-
-class OpenDoc(
-    val path: String,
-    val language: Language,
-    val lines: List<LexedLine>?,
-    val imageFile: File? = null,
-    val note: String? = null,
-) {
-    val name get() = path.substringAfterLast('/')
-    val dir get() = path.substringBeforeLast('/', "")
 }
 
 /** A one-shot instruction for the code view: reveal a location, or restore a scroll position. */
@@ -78,6 +72,8 @@ class Workspace(val info: RepoInfo, val paths: List<String>) {
     var index by mutableStateOf<SymbolIndex?>(null)
     var indexProgress by mutableStateOf<IndexProgress?>(IndexProgress("Preparing", 0, 0))
     var indexError by mutableStateOf<String?>(null)
+    /** Non-fatal: e.g. "Navigation limited to N of M files". */
+    var indexNote by mutableStateOf<String?>(null)
     var doc by mutableStateOf<OpenDoc?>(null)
     var lenses by mutableStateOf<Map<Int, String>>(emptyMap())
     var lensSymbols: Map<Int, Symbol> = emptyMap()
@@ -88,9 +84,17 @@ class Workspace(val info: RepoInfo, val paths: List<String>) {
     val history = mutableStateListOf<Location>()
 }
 
-class AppViewModel(app: Application) : AndroidViewModel(app) {
+class AppViewModel(app: Application, private val saved: SavedStateHandle) : AndroidViewModel(app) {
+    constructor(app: Application) : this(app, SavedStateHandle())
+
     private val prefs = app.getSharedPreferences("repolens", Context.MODE_PRIVATE)
-    private val downloader = RepoDownloader(File(app.filesDir, "repos"))
+    private val crashStore = CrashReporter.store(app)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Replaceable in tests (local HTTP server, small limits, failing loaders). */
+    internal var downloader = RepoDownloader(File(app.filesDir, "repos"))
+    internal var docLoader: (File, String) -> OpenDoc = { root, path -> DocLoader.load(root, path) }
+    internal var indexLimits: () -> IndexLimits = { IndexLimits.forHeap() }
 
     var input by mutableStateOf("")
     var busyMessage by mutableStateOf<String?>(null)
@@ -100,7 +104,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var workspace by mutableStateOf<Workspace?>(null)
         private set
 
-    var textSizeSp by mutableStateOf(prefs.getFloat("textSize", 11f))
+    /** The report of a crash in the previous run, until the user dismisses it. */
+    var crashReport by mutableStateOf<String?>(null)
+        private set
+
+    var textSizeSp by mutableStateOf(prefs.getFloat("textSize", 11f).let { if (it.isNaN()) 11f else it })
         private set
     var wrapCode by mutableStateOf(prefs.getBoolean("wrapCode", false))
         private set
@@ -116,10 +124,71 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var refsJob: Job? = null
     private var requestIds = 0L
 
+    /** Last line of defence: an exception that escapes a coroutine becomes a message, not a crash. */
+    private val handler = CoroutineExceptionHandler { _, e -> onUnexpected("Something went wrong", e) }
+
+    init {
+        launchSafe("startup") {
+            val report = withContext(Dispatchers.IO) {
+                try { downloader.sweepLeftovers() } catch (e: Exception) { Log.w(TAG, "sweep failed", e) }
+                crashStore.pending()
+            }
+            crashReport = report
+            // The process was killed in the background and Android recreated the activity: reopen
+            // the repository that was open, unless the app crashed while showing it last time.
+            val restore = saved.get<String>(KEY_REPO)
+            if (restore != null && workspace == null && busyMessage == null) {
+                val crashed = crashStore.crashedRepo(report)
+                if (crashed != null && crashed.equals(restore, ignoreCase = true)) {
+                    saved.remove<String>(KEY_REPO)
+                    error = "RepoLens closed unexpectedly while $restore was open, so it wasn't reopened automatically."
+                } else {
+                    open(restore, restoreFile = saved.get<String>(KEY_FILE))
+                }
+            }
+        }
+    }
+
+    private fun launchSafe(what: String, onError: (Throwable) -> Unit = {}, block: suspend CoroutineScope.() -> Unit): Job =
+        viewModelScope.launch(handler) {
+            try {
+                block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e(TAG, "$what failed", e)
+                try { onError(e) } catch (e2: Throwable) { onUnexpected(what, e2) }
+            }
+        }
+
+    private fun onUnexpected(what: String, e: Throwable) {
+        Log.e(TAG, what, e)
+        val msg = "$what: ${describe(e)}"
+        val ws = workspace
+        if (ws != null) ws.message = msg else { busyMessage = null; error = msg }
+    }
+
+    private fun describe(e: Throwable): String = when (e) {
+        is RepoException -> e.message ?: "Download failed."
+        is OutOfMemoryError -> "Not enough memory on this phone."
+        else -> e.message?.let { "$it (${e.javaClass.simpleName})" } ?: e.javaClass.simpleName
+    }
+
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
+    }
+
+    // ===================== crash report =====================
+
+    fun dismissCrashReport() {
+        crashReport = null
+        launchSafe("clear crash report") { withContext(Dispatchers.IO) { crashStore.clear() } }
+    }
+
     // ===================== repositories =====================
 
-    fun open(text: String = input, refresh: Boolean = false) {
-        val ref = RepoRef.parse(text)
+    fun open(text: String = input, refresh: Boolean = false, restoreFile: String? = null) {
+        val ref = try { RepoRef.parse(text) } catch (e: Exception) { null }
         if (ref == null) {
             error = "That doesn't look like a GitHub repository link. Try https://github.com/owner/repo"
             return
@@ -127,30 +196,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         input = "https://github.com/${ref.fullName}"
         error = null
         openJob?.cancel()
-        openJob = viewModelScope.launch {
-            try {
-                busyMessage = "Opening ${ref.fullName}…"
-                val cached = if (refresh) null else downloader.cached(ref)
-                val info = cached ?: downloader.download(ref) { msg -> busyMessage = msg }
-                busyMessage = "Reading files…"
-                val paths = withContext(Dispatchers.IO) { SymbolIndex.listFiles(info.dir) }
-                if (paths.isEmpty()) throw RepoException("This repository is empty.")
-                rememberRecent(info)
-                val ws = Workspace(info, paths)
-                workspace = ws
-                busyMessage = null
-                startIndexing(ws)
-                val first = ref.path?.takeIf { it in paths }
-                    ?: paths.firstOrNull { it.equals("README.md", true) }
-                    ?: paths.firstOrNull { it.startsWith("README", true) && '/' !in it }
-                    ?: paths.first()
-                openFile(first, null, pushHistory = false)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                busyMessage = null
-                error = e.message ?: e.javaClass.simpleName
-            }
+        openJob = launchSafe("open", onError = { e -> busyMessage = null; error = describe(e) }) {
+            busyMessage = "Opening ${ref.fullName}…"
+            CrashReporter.breadcrumb(getApplication(), "Opening ${ref.fullName}")
+            val cached = if (refresh) null else withContext(Dispatchers.IO) { downloader.cached(ref) }
+            val info = cached ?: downloader.download(ref) { msg -> onMain { if (busyMessage != null) busyMessage = msg } }
+            busyMessage = "Reading files…"
+            val paths = withContext(Dispatchers.IO) { SymbolIndex.listFiles(info.dir) }
+            if (paths.isEmpty()) throw RepoException("This repository is empty.")
+            rememberRecent(info)
+            val ws = Workspace(info, paths)
+            workspace = ws
+            busyMessage = null
+            saved[KEY_REPO] = info.ref.fullName
+            CrashReporter.breadcrumb(getApplication(), "Browsing ${info.ref.fullName}")
+            startIndexing(ws)
+            val first = restoreFile?.takeIf { it in paths }
+                ?: ref.path?.takeIf { it in paths }
+                ?: paths.firstOrNull { it.equals("README.md", true) }
+                ?: paths.firstOrNull { it.startsWith("README", true) && '/' !in it }
+                ?: paths.first()
+            openFile(first, null, pushHistory = false)
         }
     }
 
@@ -162,32 +228,52 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun closeRepo() {
         indexJob?.cancel(); docJob?.cancel(); refsJob?.cancel()
         workspace = null
+        saved.remove<String>(KEY_REPO); saved.remove<String>(KEY_FILE)
+        CrashReporter.breadcrumb(getApplication(), null)
         recents = loadRecents()
     }
 
     fun deleteRecent(r: RecentRepo) {
-        downloader.delete(RepoRef(r.owner, r.repo))
         val list = recents.filterNot { it.fullName == r.fullName }
         saveRecents(list)
         recents = list
+        launchSafe("delete") { withContext(Dispatchers.IO) { downloader.delete(RepoRef(r.owner, r.repo)) } }
+    }
+
+    private val pendingProgress = AtomicReference<IndexProgress?>()
+
+    /** Called from indexing threads: coalesces updates and applies them on the main thread. */
+    private fun postProgress(ws: Workspace, p: IndexProgress) {
+        if (pendingProgress.getAndSet(p) == null) {
+            mainHandler.post {
+                val q = pendingProgress.getAndSet(null)
+                if (q != null && ws.index == null && ws.indexError == null && workspace === ws) ws.indexProgress = q
+            }
+        }
     }
 
     private fun startIndexing(ws: Workspace) {
         indexJob?.cancel()
-        indexJob = viewModelScope.launch {
-            try {
-                val index = SymbolIndex.build(ws.info.dir) { p -> ws.indexProgress = p }
-                ws.index = index
-                ws.indexProgress = null
-                refreshLenses(ws)
-                // re-evaluate a selection made while indexing
-                ws.selection?.let { s -> select(ws, s.line, s.col, s.word) }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                ws.indexProgress = null
-                ws.indexError = "Indexing failed: ${e.message ?: e.javaClass.simpleName}"
+        indexJob = launchSafe("index", onError = { e ->
+            ws.indexProgress = null
+            ws.indexError = if (e is OutOfMemoryError) {
+                "Not enough memory to index this repository — you can still browse and read every file."
+            } else {
+                "Indexing failed: ${describe(e)}"
             }
+        }) {
+            val index = try {
+                SymbolIndex.build(ws.info.dir, indexLimits()) { p -> postProgress(ws, p) }
+            } catch (e: OutOfMemoryError) {
+                System.gc() // the partial index is already unreachable
+                throw e
+            }
+            ws.index = index
+            ws.indexNote = index.note
+            ws.indexProgress = null
+            refreshLenses(ws)
+            // re-evaluate a selection made while indexing
+            ws.selection?.let { s -> select(ws, s.line, s.col, s.word) }
         }
     }
 
@@ -204,31 +290,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         docJob?.cancel()
-        docJob = viewModelScope.launch {
-            val doc = withContext(Dispatchers.Default) { loadDoc(ws.info.dir, path) }
+        docJob = launchSafe("open file", onError = { e ->
+            ws.lenses = emptyMap(); ws.lensSymbols = emptyMap()
+            ws.doc = OpenDoc(path, Languages.PLAIN, null, note = "Couldn't open this file: ${describe(e)}")
+        }) {
+            val doc = withContext(Dispatchers.Default) { docLoader(ws.info.dir, path) }
             ws.lenses = emptyMap(); ws.lensSymbols = emptyMap()
             ws.doc = doc
+            saved[KEY_FILE] = path
+            CrashReporter.breadcrumb(getApplication(), "Browsing ${ws.info.ref.fullName}, file $path")
             reveal?.let { request(ws, it, restoreTop) }
             refreshLenses(ws)
         }
-    }
-
-    private fun loadDoc(root: File, path: String): OpenDoc {
-        val file = File(root, path)
-        val name = path.substringAfterLast('/')
-        val lang = Languages.forFileName(name)
-        if (SourceText.isImage(name)) return OpenDoc(path, lang, null, imageFile = file)
-        if (SourceText.isKnownBinary(name)) return OpenDoc(path, lang, null, note = "Binary file (${RepoDownloader.formatBytes(file.length())}) — nothing to show.")
-        if (file.length() > SourceText.MAX_DISPLAY_BYTES) return OpenDoc(path, lang, null, note = "This file is ${RepoDownloader.formatBytes(file.length())} — too large to display.")
-        val lines = SourceText.readLines(file) ?: return OpenDoc(path, lang, null, note = "Binary file — nothing to show.")
-        return OpenDoc(path, lang, Lexer(lang).lexAll(lines))
     }
 
     private fun refreshLenses(ws: Workspace) {
         val doc = ws.doc ?: return
         val index = ws.index ?: return
         if (!showLenses) { ws.lenses = emptyMap(); ws.lensSymbols = emptyMap(); return }
-        viewModelScope.launch {
+        launchSafe("reference counts") {
             val (labels, syms) = withContext(Dispatchers.Default) {
                 val labels = HashMap<Int, String>()
                 val syms = HashMap<Int, Symbol>()
@@ -259,10 +339,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             ws.selection = WordSelection(word, doc.path, line, col, null, emptyList(), null, indexReady = false)
             return
         }
-        val site = index.definitionAt(doc.path, line, col)
-        val defs = index.definitionsFor(word, doc.path, line)
-        val count = site?.let { index.referenceCount(it) } ?: defs.firstOrNull()?.let { index.referenceCount(it) }
-        ws.selection = WordSelection(word, doc.path, line, col, site, defs, count, indexReady = true)
+        ws.selection = try {
+            val site = index.definitionAt(doc.path, line, col)
+            val defs = index.definitionsFor(word, doc.path, line)
+            val count = site?.let { index.referenceCount(it) } ?: defs.firstOrNull()?.let { index.referenceCount(it) }
+            WordSelection(word, doc.path, line, col, site, defs, count, indexReady = true)
+        } catch (e: Exception) {
+            Log.e(TAG, "select failed", e)
+            WordSelection(word, doc.path, line, col, null, emptyList(), null, indexReady = true)
+        }
     }
 
     fun clearSelection() {
@@ -272,7 +357,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun goToDefinition() {
         val ws = workspace ?: return
         val sel = ws.selection ?: return
-        val defs = sel.definitions.filter { it !== sel.site }
+        val defs = sel.definitions.filter { it != sel.site }
         when {
             defs.isEmpty() -> ws.message = "No other definition of “${sel.word}” in this repository."
             defs.size == 1 || defs.all { it.file == defs[0].file } || defs[0].file.path == sel.path ->
@@ -284,7 +369,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun showDefinitionChooser(ws: Workspace, word: String, defs: List<Symbol>) {
         ws.sheet = NavSheet("Definitions of $word", "${defs.size} candidates, closest first", loading = true)
         refsJob?.cancel()
-        refsJob = viewModelScope.launch {
+        refsJob = launchSafe("definitions", onError = { e -> ws.sheet = NavSheet("Definitions of $word", "Couldn't list them: ${describe(e)}") }) {
             val files = withContext(Dispatchers.IO) {
                 groupByFile(ws.info.dir, defs.map { Occurrence(it.file, it.line, it.col, it.name.length) }, labels = defs.associate { key(it.file.path, it.line, it.col) to it.kind.label }, keepOrder = true)
             }
@@ -310,15 +395,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val index = ws.index ?: run { ws.message = "Still indexing — try again in a moment."; return }
         ws.sheet = NavSheet("References to $word", "Searching…", loading = true)
         refsJob?.cancel()
-        refsJob = viewModelScope.launch {
+        refsJob = launchSafe("references", onError = { e -> ws.sheet = NavSheet("References to $word", "Couldn't search: ${describe(e)}") }) {
             val textSearch = symbol == null
             val occ: List<Occurrence> = if (symbol != null) {
-                withContext(Dispatchers.Default) { index.referencesTo(symbol) }
+                withContext(Dispatchers.Default) { index.referencesTo(symbol, limit = MAX_LISTED_REFS) }
             } else {
                 val family = ws.doc?.language?.family
                 index.searchWord(word, family?.takeIf { it != Family.DATA })
             }
-            val defs = if (symbol != null) index.definitionsFor(word, symbol.file.path, symbol.line).filter { it.name == symbol.name && it.kind == symbol.kind || it === symbol } else emptyList()
+            val defs = if (symbol != null) index.definitionsFor(word, symbol.file.path, symbol.line).filter { it.name == symbol.name && it.kind == symbol.kind || it == symbol } else emptyList()
+            val total = if (symbol != null && occ.size >= MAX_LISTED_REFS) index.referenceCount(symbol) else occ.size
             val (defFiles, folders) = withContext(Dispatchers.IO) {
                 val d = groupByFile(ws.info.dir, defs.map { Occurrence(it.file, it.line, it.col, it.name.length) }, labels = defs.associate { key(it.file.path, it.line, it.col) to it.kind.label }, keepOrder = true)
                 val files = groupByFile(ws.info.dir, occ, emptyMap(), keepOrder = false)
@@ -329,6 +415,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 title = "References to $word",
                 subtitle = when {
                     occ.isEmpty() -> "No uses found"
+                    total > occ.size -> "$total references · showing the first ${occ.size}, in $fileCount files"
                     else -> "${occ.size} ${if (occ.size == 1) "reference" else "references"} in $fileCount ${if (fileCount == 1) "file" else "files"}"
                 },
                 definitions = defFiles,
@@ -345,7 +432,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         for (o in occ) byFile.getOrPut(o.file.path) { ArrayList() }.add(o)
         val paths = if (keepOrder) byFile.keys.toList() else byFile.keys.sorted()
         return paths.map { path ->
-            val lines = SourceText.readLines(File(root, path)) ?: emptyList()
+            val lines = try { SourceText.readLines(File(root, path)) } catch (e: Exception) { null } ?: emptyList()
             RefFile(path, byFile.getValue(path).sortedWith(compareBy({ it.line }, { it.col })).map { o ->
                 val raw = lines.getOrElse(o.line) { "" }
                 val indent = raw.length - raw.trimStart().length
@@ -369,7 +456,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun pushCurrentLocation(ws: Workspace) {
         val doc = ws.doc ?: return
-        val top = topLineProvider().coerceAtLeast(0)
+        val top = try { topLineProvider().coerceAtLeast(0) } catch (e: Exception) { 0 }
         ws.history.add(Location(doc.path, top))
         if (ws.history.size > 100) ws.history.removeAt(0)
     }
@@ -396,6 +483,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ===================== settings =====================
 
     fun updateTextSize(sp: Float) {
+        if (sp.isNaN() || sp.isInfinite()) return
         textSizeSp = sp
         prefs.edit().putFloat("textSize", sp).apply()
     }
@@ -420,14 +508,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         recents = list.take(20)
     }
 
-    private fun loadRecents(): List<RecentRepo> =
+    private fun loadRecents(): List<RecentRepo> = try {
         prefs.getString("recents", "").orEmpty().lines().mapNotNull { l ->
             val p = l.split('\t')
             if (p.size < 5) null else RecentRepo(p[0], p[1], p[2], p[3].toLongOrNull() ?: 0, p[4].toLongOrNull() ?: 0)
-        }
+        }.distinctBy { it.fullName.lowercase() }
+    } catch (e: Exception) {
+        emptyList()
+    }
 
     private fun saveRecents(list: List<RecentRepo>) {
         prefs.edit().putString("recents", list.joinToString("\n") { "${it.owner}\t${it.repo}\t${it.branch}\t${it.openedAt}\t${it.bytes}" }).apply()
+    }
+
+    private companion object {
+        const val TAG = "RepoLens"
+        const val KEY_REPO = "openRepo"
+        const val KEY_FILE = "openFile"
+        /** A references sheet lists at most this many results (the count above it is exact). */
+        const val MAX_LISTED_REFS = 5000
     }
 
     fun isProse(doc: OpenDoc?) = doc != null && doc.language == Languages.PLAIN &&

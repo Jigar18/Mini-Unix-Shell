@@ -54,6 +54,9 @@ android {
                 it.systemProperty("roborazzi.test.record", "true")
                 it.systemProperty("robolectric.pixelCopyRenderMode", "hardware")
                 it.maxHeapSize = "3g"
+                // A fresh JVM per test class: Robolectric's native graphics for each SDK holds a lot
+                // of native memory, and the multi-SDK tests would otherwise add it all up.
+                it.forkEvery = 1
                 // Optional: where Robolectric downloads its Android runtime jars (for restricted networks).
                 System.getenv("ROBOLECTRIC_REPO_URL")?.let { url -> it.systemProperty("robolectric.dependency.repo.url", url) }
             }

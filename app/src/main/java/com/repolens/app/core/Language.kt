@@ -14,9 +14,26 @@ enum class SymbolKind(val label: String, val showsReferenceLens: Boolean) {
     MACRO("macro", true),
 }
 
-/** A regex whose [group] captures the name of a symbol defined on that (masked) line. */
-class DefPattern(pattern: String, val kind: SymbolKind, val group: Int = 1) {
-    val regex = Regex(pattern)
+/**
+ * A regex whose [group] captures the name of a symbol defined on that (masked) line.
+ *
+ * On Android `java.util.regex` is implemented by ICU, which is stricter than the JVM engine the
+ * unit tests run on: an unescaped `}` (accepted by the JVM) is a syntax error there. These
+ * patterns are compiled while the [Languages] object initialises, so a single bad pattern used to
+ * make `Languages` unusable and crash the app the moment any repository was opened. Patterns
+ * must be ICU-compatible (see `RegexCompatibilityTest`); if one still fails to compile on some
+ * device it is dropped instead of taking the whole class down.
+ */
+class DefPattern(val pattern: String, val kind: SymbolKind, val group: Int = 1) {
+    val regex: Regex? = compileOrNull(pattern)
+
+    companion object {
+        fun compileOrNull(pattern: String): Regex? = try {
+            Regex(pattern)
+        } catch (e: Exception) {
+            null
+        }
+    }
 }
 
 class Language(
@@ -59,9 +76,9 @@ object Languages {
     private val C_TYPES = listOf(
         DefPattern("""\b(?:class|struct|union|enum|namespace)\s+(?:class\s+|struct\s+)?(?:[A-Z_]+\s+)?($IDENT)\s*(?:final\s*)?(?:[:{]|$)""", SymbolKind.CLASS),
         DefPattern("""^\s*#\s*define\s+($IDENT)""", SymbolKind.MACRO),
-        DefPattern("""^\s*}\s*($IDENT)\s*;""", SymbolKind.CLASS),
+        DefPattern("""^\s*\}\s*($IDENT)\s*;""", SymbolKind.CLASS),
         DefPattern("""^\s*typedef\b[^;({]*\b($IDENT)\s*;""", SymbolKind.CLASS),
-        DefPattern("""^\s*typedef\b.*}\s*($IDENT)\s*;""", SymbolKind.CLASS),
+        DefPattern("""^\s*typedef\b.*\}\s*($IDENT)\s*;""", SymbolKind.CLASS),
         DefPattern("""^\s*typedef\b[^;]*\(\s*\*\s*($IDENT)\s*\)""", SymbolKind.CLASS),
     )
 
@@ -336,6 +353,9 @@ object Languages {
         "gemfile" to RUBY, "rakefile" to RUBY, "podfile" to RUBY, "vagrantfile" to RUBY,
         "build" to PYTHON, "workspace" to PYTHON, ".bashrc" to SHELL, ".zshrc" to SHELL, ".profile" to SHELL,
     )
+
+    /** Every regex source used for definitions, for the ICU compatibility test. */
+    internal val allPatterns: List<String> get() = all.flatMap { l -> l.defPatterns.map { it.pattern } }
 
     fun forFileName(fileName: String): Language {
         val lower = fileName.lowercase()

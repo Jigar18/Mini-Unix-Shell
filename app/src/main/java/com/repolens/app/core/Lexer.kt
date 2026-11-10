@@ -257,3 +257,14 @@ class LongArrayList(capacity: Int = 8) {
     operator fun get(i: Int) = data[i]
     fun toArray(): LongArray = data.copyOf(size)
 }
+
+class ByteArrayList(capacity: Int = 16) {
+    private var data = ByteArray(capacity)
+    var size = 0; private set
+    fun add(v: Byte) {
+        if (size == data.size) data = data.copyOf(maxOf(16, data.size * 2))
+        data[size++] = v
+    }
+    operator fun get(i: Int) = data[i]
+    fun toArray(): ByteArray = data.copyOf(size)
+}

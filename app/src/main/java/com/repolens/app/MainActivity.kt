@@ -42,10 +42,17 @@ class MainActivity : ComponentActivity() {
 
     /** "Share → RepoLens" from the GitHub app or a browser. */
     private fun handleShare(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND) return
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
-        vm.input = text
+        // Extras come from other apps: a malformed parcel or a styled CharSequence must not crash us.
+        val text = try {
+            if (intent?.action != Intent.ACTION_SEND) return
+            intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+        } catch (e: Exception) {
+            null
+        }
+        if (text.isNullOrBlank()) return
+        val link = text.take(4000)
+        vm.input = link
         vm.closeRepo()
-        vm.open(text)
+        vm.open(link)
     }
 }

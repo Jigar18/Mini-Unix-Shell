@@ -21,7 +21,8 @@ object DefinitionFinder {
             if (list.none { it.name == clean }) list.add(FoundDef(clean, kind, col + if (name.startsWith('`')) 1 else 0))
         }
         for (p in lang.defPatterns) {
-            for (m in p.regex.findAll(masked)) {
+            val regex = p.regex ?: continue
+            for (m in regex.findAll(masked)) {
                 val g = m.groups[p.group] ?: continue
                 add(g.value, p.kind, g.range.first)
             }
@@ -32,10 +33,16 @@ object DefinitionFinder {
         return result ?: emptyList()
     }
 
-    private val callLike = Regex("""(~?[A-Za-z_$][\w$]*)\s*\(""")
-    private val annotation = Regex("""@[\w.]+(?:\s*\([^)]*\))?""")
-    private val prefixChars = Regex("""^[\s\w$<>\[\],.?*&:~]*$""")
-    private val wordSplit = Regex("""[\s*&]+""")
+    private const val CALL_LIKE = """(~?[A-Za-z_$][\w$]*)\s*\("""
+    private const val ANNOTATION = """@[\w.]+(?:\s*\([^)]*\))?"""
+    private const val PREFIX_CHARS = """^[\s\w$<>\[\],.?*&:~]*$"""
+    private const val WORD_SPLIT = """[\s*&]+"""
+    internal val allPatterns = listOf(CALL_LIKE, ANNOTATION, PREFIX_CHARS, WORD_SPLIT)
+
+    private val callLike = Regex(CALL_LIKE)
+    private val annotation = Regex(ANNOTATION)
+    private val prefixChars = Regex(PREFIX_CHARS)
+    private val wordSplit = Regex(WORD_SPLIT)
 
     private val control = setOf(
         "if", "for", "while", "switch", "catch", "return", "sizeof", "new", "throw", "else", "do", "synchronized",
