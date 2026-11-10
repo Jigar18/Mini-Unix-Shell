@@ -70,10 +70,7 @@ class MainActivity : ComponentActivity() {
             null
         }
         if (text.isNullOrBlank()) return
-        val link = text.take(4000)
-        vm.input = link
-        vm.closeRepo()
-        vm.open(link)
+        vm.openShared(text)
     }
 
     private companion object {

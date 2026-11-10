@@ -135,6 +135,20 @@ class SymbolIndex private constructor(
         return (from until to).map { symbolAt(it) }
     }
 
+    /**
+     * The definitions that get an "N references" lens in [path]: at most one per line, and no
+     * separate lens for a constructor (a function named like a class defined in the same file),
+     * whose calls are already counted by the class's lens.
+     */
+    fun lensSymbols(path: String): List<Symbol> {
+        val defs = definitionsInFile(path)
+        val classes = defs.filter { it.kind == SymbolKind.CLASS }.mapTo(HashSet()) { it.name }
+        val lines = HashSet<Int>()
+        return defs.filter { s ->
+            s.kind.showsReferenceLens && !(s.kind == SymbolKind.FUNCTION && s.name in classes) && lines.add(s.line)
+        }
+    }
+
     fun definitionAt(path: String, line: Int, col: Int): Symbol? {
         val f = file(path) ?: return null
         val target = pack(f.id, line, col)
@@ -181,13 +195,22 @@ class SymbolIndex private constructor(
         return if (id < 0) EMPTY_LONGS else occurrences[id]
     }
 
+    /**
+     * In languages where a function is always called with `(` (or referenced with `::`), only
+     * such uses count for a function: a parameter or local that happens to share its name
+     * (`String refreshToken` next to a `refreshToken()` method) is not a reference to it.
+     */
+    private fun callsOnly(symbol: Symbol) = symbol.kind == SymbolKind.FUNCTION && symbol.file.language.functionUsesAreCalls
+
     /** All uses of [symbol] in the repo (definition sites excluded). */
     fun referencesTo(symbol: Symbol, limit: Int = Int.MAX_VALUE): List<Occurrence> {
         val packed = usesOf(symbol.name)
         val family = symbol.file.language.family
         val onlyFile = if (symbol.isLocalVariable) symbol.file.id else -1
+        val calls = callsOnly(symbol)
         val out = ArrayList<Occurrence>()
         for (p in packed) {
+            if (calls && !isCallSite(p)) continue
             val f = files[unpackFile(p)]
             if (f.language.family != family) continue
             if (onlyFile >= 0 && f.id != onlyFile) continue
@@ -203,10 +226,11 @@ class SymbolIndex private constructor(
         val id = names.find(symbol.name, 0, symbol.name.length)
         if (id < 0) return 0
         val family = symbol.file.language.family
-        val key = (id.toLong() shl 8) or family.ordinal.toLong()
+        val calls = callsOnly(symbol)
+        val key = (id.toLong() shl 9) or (family.ordinal.toLong() shl 1) or (if (calls) 1L else 0L)
         synchronized(refCountCache) { refCountCache[key]?.let { return it } }
         var n = 0
-        for (p in occurrences[id]) if (files[unpackFile(p)].language.family == family) n++
+        for (p in occurrences[id]) if ((!calls || isCallSite(p)) && files[unpackFile(p)].language.family == family) n++
         synchronized(refCountCache) { refCountCache[key] = n }
         return n
     }
@@ -238,13 +262,15 @@ class SymbolIndex private constructor(
     }
 
     /** "Go to symbol" search: prefix matches first, then substring matches. */
-    fun searchSymbols(query: String, limit: Int = 200): List<Symbol> {
+    fun searchSymbols(query: String, limit: Int = 200, cancelled: () -> Boolean = { false }): List<Symbol> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
         val lower = q.lowercase()
         val prefix = ArrayList<Symbol>()
         val contains = ArrayList<Symbol>()
         for (id in 0 until names.size) {
+            // a newer query replaces this one: stop instead of finishing a scan nobody will see
+            if (id and 1023 == 0 && cancelled()) throw kotlinx.coroutines.CancellationException("symbol search replaced")
             val ln = names[id].lowercase()
             val bucket = when {
                 ln.startsWith(lower) -> prefix
@@ -278,11 +304,60 @@ class SymbolIndex private constructor(
         const val MAX_PACKED_LINE = (1 shl 22) - 1
         const val MAX_PACKED_COL = (1 shl 20) - 1
 
+        /**
+         * `file:21 | line:22 | col:20 | call:1`. The low bit is only set on stored uses: the use
+         * is call-like (followed by `(`, `{` or `<…>(`, after `::`, a `<Component` tag, or on an
+         * `import` line). Sort order stays file, line, column.
+         */
         fun pack(file: Int, line: Int, col: Int): Long =
-            (file.toLong() shl 42) or ((line.toLong() and 0x3FFFFF) shl 20) or (col.toLong() and 0xFFFFF)
-        fun unpackFile(p: Long) = (p ushr 42).toInt()
-        fun unpackLine(p: Long) = ((p ushr 20) and 0x3FFFFF).toInt()
-        fun unpackCol(p: Long) = (p and 0xFFFFF).toInt()
+            (file.toLong() shl 43) or ((line.toLong() and 0x3FFFFF) shl 21) or ((col.toLong() and 0xFFFFF) shl 1)
+        fun unpackFile(p: Long) = (p ushr 43).toInt()
+        fun unpackLine(p: Long) = ((p ushr 21) and 0x3FFFFF).toInt()
+        fun unpackCol(p: Long) = ((p ushr 1) and 0xFFFFF).toInt()
+        private const val CALL_BIT = 1L
+        fun isCallSite(p: Long) = p and CALL_BIT != 0L
+
+        /** `import a.b.c` (Kotlin, Java, also `import static`): every name on it is a reference. */
+        private fun isImportLine(text: String): Boolean {
+            var k = 0
+            while (k < text.length && text[k] == ' ') k++
+            return text.startsWith("import ", k)
+        }
+
+        /** Whether the identifier at [s] until [e] in [text] is used like a call or a function reference. */
+        internal fun isCallLike(text: String, s: Int, e: Int): Boolean {
+            val n = text.length
+            var k = e
+            while (k < n && text[k] == ' ') k++
+            if (k < n) {
+                when (text[k]) {
+                    '(', '{' -> return true
+                    '<' -> { // generic call: foo<T>(…) / foo<Map<K, V>>(…)
+                        var depth = 0
+                        var j = k
+                        val lim = minOf(n, k + 120)
+                        while (j < lim) {
+                            when (text[j]) {
+                                '<' -> depth++
+                                '>' -> { depth--; if (depth == 0) break }
+                                '(', ')', ';', '=', '{', '}', '&', '|' -> { j = lim; break }
+                            }
+                            j++
+                        }
+                        if (j < lim) {
+                            j++
+                            while (j < n && text[j] == ' ') j++
+                            if (j < n && text[j] == '(') return true
+                        }
+                    }
+                }
+            }
+            var b = s - 1
+            while (b >= 0 && text[b] == ' ') b--
+            if (b >= 1 && text[b] == ':' && text[b - 1] == ':') return true // Foo::bar, ::bar
+            if (b >= 0 && text[b] == '/') b--
+            return b >= 0 && text[b] == '<' // <Component …> / </Component>
+        }
         private fun packable(line: Int, col: Int) = line in 0..MAX_PACKED_LINE && col in 0..MAX_PACKED_COL
 
         private fun isWordChar(c: Char) = c.isLetterOrDigit() || c == '_' || c == '$'
@@ -524,6 +599,7 @@ class SymbolIndex private constructor(
                 val lexer = Lexer(f.language)
                 for ((i, text) in lines.withIndex()) {
                     val lexed = lexer.lexLine(text)
+                    val importLine = isImportLine(text)
                     for (t in 0 until lexed.tokenCount) {
                         if (!TokenType.isIdentifier(lexed.type(t))) continue
                         val s = lexed.start(t)
@@ -531,7 +607,7 @@ class SymbolIndex private constructor(
                         if (id < 0 || !packable(i, s)) continue
                         val site = pack(f.id, i, s)
                         if (isDefSite(id, site, defSites, byName, nameDefStart)) continue
-                        ids.add(id); sites.add(site)
+                        ids.add(id); sites.add(if (importLine || isCallLike(text, s, lexed.end(t))) site or CALL_BIT else site)
                     }
                 }
             }

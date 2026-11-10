@@ -71,6 +71,19 @@ class MiniHttpServer : AutoCloseable {
         repeat(chunks) { _ -> it.write(buf); it.flush(); Thread.sleep(delayMs) }
     }
 
+    /** Sends [body] in [pieces] parts with [delayMs] between them: a real archive that arrives slowly. */
+    fun slowBytes(path: String, body: ByteArray, pieces: Int, delayMs: Long) = route(path) {
+        it.write("HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray())
+        val step = (body.size + pieces - 1) / pieces
+        var from = 0
+        while (from < body.size) {
+            val to = minOf(body.size, from + step)
+            it.write(body, from, to - from); it.flush()
+            from = to
+            Thread.sleep(delayMs)
+        }
+    }
+
     /** What GitHub serves for a public repository: the API's default branch and the codeload zip. */
     fun githubRepo(owner: String, repo: String, zip: ByteArray, branch: String = "main") {
         bytes("/repos/$owner/$repo", """{"full_name":"$owner/$repo","default_branch":"$branch"}""".toByteArray(), type = "application/json")

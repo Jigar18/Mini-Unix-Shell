@@ -62,6 +62,13 @@ class Language(
     val allowUntypedMethods: Boolean = false,
     /** Names that the def patterns may capture but which are never real symbols. */
     val notSymbols: Set<String> = emptySet(),
+    /**
+     * Functions are only ever used by calling them (`f(`, trailing lambda `f {`) or with `::f`,
+     * so a bare `f` is a variable of the same name, not a use of the function. Not true where
+     * functions are passed around as values (JS, Python, Go, Dart tear-offs, C callbacks…) or
+     * called without parentheses (Ruby, Scala, Groovy).
+     */
+    val functionUsesAreCalls: Boolean = false,
 ) {
     val keywords: Set<String> = keywords.split(' ', '\n').filter { it.isNotBlank() }.toHashSet()
     val indexable: Boolean get() = defPatterns.isNotEmpty() || cStyleSignatures
@@ -89,6 +96,7 @@ object Languages {
            annotation open abstract override private protected public internal lateinit const suspend inline
            noinline crossinline reified operator infix tailrec external vararg out by get set where actual expect value""",
         tripleQuoted = true,
+        functionUsesAreCalls = true,
         defPatterns = listOf(
             DefPattern("""\bfun\s+(?:<[^>]*>\s*)?(?:[\w.<>?, *]+\.)?(`?$IDENT`?)\s*\(""", SymbolKind.FUNCTION),
             DefPattern("""\b(?:class|interface|object|typealias)\s+($IDENT)""", SymbolKind.CLASS),
@@ -103,9 +111,15 @@ object Languages {
            protected public return short static strictfp super switch synchronized this throw throws transient try void
            volatile while true false null var record sealed permits yield non-sealed""",
         cStyleSignatures = true,
+        functionUsesAreCalls = true,
         defPatterns = listOf(
             DefPattern("""\b(?:class|interface|enum|record)\s+($IDENT)""", SymbolKind.CLASS),
             DefPattern("""^\s*@interface\s+($IDENT)""", SymbolKind.CLASS),
+            // fields (and modified locals): `private final UserRepository userRepository;`, `@Id private Long id;`
+            DefPattern(
+                """^\s*(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:private|protected|public|static|final|transient|volatile)\s+)+(?:@[\w.]+\s+)*[\w.]+(?:<[^;=()]*>)?(?:\[\s*\])*\s+($IDENT)\s*(?:[;=,]|$)""",
+                SymbolKind.VARIABLE,
+            ),
         ),
     )
 

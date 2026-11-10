@@ -54,7 +54,7 @@ class CrashStore(private val dir: File) {
 
     /** The repository the app was opening or showing when it crashed, if the report says so. */
     fun crashedRepo(report: String?): String? =
-        report?.lineSequence()?.firstOrNull { it.startsWith("Doing: ") }?.let { Regex("""\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b""").find(it)?.value }
+        report?.lineSequence()?.firstOrNull { it.startsWith("Doing: ") }?.let { Regex(REPO_NAME).find(it)?.value }
 
     /**
      * Records uncaught exceptions to the store, logs them, then hands them to the handler that was
@@ -75,6 +75,9 @@ class CrashStore(private val dir: File) {
 
     companion object {
         private const val MAX_CHARS = 64 * 1024
+        private const val REPO_NAME = """\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b"""
+        /** Every regex source used here, for the ICU compatibility test. */
+        internal val allPatterns = listOf(REPO_NAME)
     }
 }
 

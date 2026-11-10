@@ -94,8 +94,14 @@ class RepoDownloader(
     /** Where versions before 1.1 kept a copy (exact case). */
     private fun legacyDir(ref: RepoRef) = File(baseDir, "${ref.owner}/${ref.repo}")
     private fun key(ref: RepoRef) = "${ref.owner}_${ref.repo}".lowercase(Locale.ROOT)
-    private fun tmpZip(ref: RepoRef) = File(baseDir, "${key(ref)}.zip.part")
-    private fun staging(ref: RepoRef) = File(baseDir, "${key(ref)}.staging")
+    /**
+     * Temporary files are unique per download (`owner_repo~<n>.zip.part`): a cancelled download
+     * whose thread is still blocked in a read must not delete the files of the download that
+     * replaced it when it finally cleans up. `~` can't appear in GitHub names, so the prefix is
+     * unambiguous.
+     */
+    private fun tmpPrefix(ref: RepoRef) = "${key(ref)}$TMP_SEP"
+    private fun newTmpTag(ref: RepoRef) = "${tmpPrefix(ref)}${System.nanoTime().toString(36)}${tmpCounter.incrementAndGet()}"
 
     /** A complete copy downloaded earlier, if any. Does file I/O: call off the main thread. */
     fun cached(ref: RepoRef): RepoInfo? {
@@ -114,8 +120,8 @@ class RepoDownloader(
     fun delete(ref: RepoRef) {
         repoDir(ref).deleteRecursively()
         legacyDir(ref).deleteRecursively()
-        tmpZip(ref).delete()
-        staging(ref).deleteRecursively()
+        val prefix = tmpPrefix(ref)
+        baseDir.listFiles()?.forEach { f -> if (f.name.startsWith(prefix) && isTmpName(f.name)) f.deleteRecursively() }
     }
 
     /**
@@ -126,20 +132,20 @@ class RepoDownloader(
     fun sweepLeftovers(olderThanMs: Long = 60 * 60 * 1000L) {
         val now = System.currentTimeMillis()
         baseDir.listFiles()?.forEach { f ->
-            if ((f.name.endsWith(".zip.part") || f.name.endsWith(".staging")) && now - f.lastModified() > olderThanMs) f.deleteRecursively()
+            if (isTmpName(f.name) && now - f.lastModified() > olderThanMs) f.deleteRecursively()
         }
     }
 
     suspend fun download(ref: RepoRef, onProgress: (String) -> Unit): RepoInfo = withContext(Dispatchers.IO) {
         onProgress("Looking up ${ref.fullName}…")
         baseDir.mkdirs()
-        val tmpZip = tmpZip(ref)
-        val staging = staging(ref)
+        val tag = newTmpTag(ref)
+        val tmpZip = File(baseDir, "$tag.zip.part")
+        val staging = File(baseDir, "$tag.staging")
         try {
-            tmpZip.delete()
-            staging.deleteRecursively()
             if (baseDir.usableSpace in 1 until MIN_FREE_BYTES) throw RepoException("Not enough free storage on this phone to download a repository.")
-            val candidates = archiveCandidates(ref)
+            val default = if (ref.ref == null) defaultBranch(ref) else null
+            val candidates = archiveCandidates(ref, default)
             var branch: String? = null
             var lastStatus = 0
             for ((b, url) in candidates) {
@@ -151,7 +157,8 @@ class RepoDownloader(
             if (branch == null) {
                 throw RepoException(
                     when (lastStatus) {
-                        404 -> "Couldn't find ${ref.fullName}${ref.ref?.let { " @ $it" } ?: ""}. Check the URL — private repositories aren't supported."
+                        // The API knows the repository but there is no archive of it: nothing was ever pushed.
+                        404 -> if (default != null) "This repository is empty." else "Couldn't find ${ref.fullName}${ref.ref?.let { " @ $it" } ?: ""}. Check the URL — private repositories aren't supported."
                         403, 429 -> "GitHub is rate-limiting this network right now. Try again in a few minutes."
                         else -> "Download failed (HTTP $lastStatus)."
                     },
@@ -198,10 +205,9 @@ class RepoDownloader(
     private fun isOutOfSpace(e: IOException) = e.message?.let { "ENOSPC" in it || "No space left" in it } == true
 
     /** (branch label, archive url) pairs to try in order. */
-    private fun archiveCandidates(ref: RepoRef): List<Pair<String, String>> {
+    private fun archiveCandidates(ref: RepoRef, default: String?): List<Pair<String, String>> {
         val base = "$codeloadBase/${ref.owner}/${ref.repo}/zip"
         if (ref.ref == null) {
-            val default = defaultBranch(ref)
             val list = ArrayList<Pair<String, String>>()
             if (default != null) list.add(default to "$base/refs/heads/${enc(default)}")
             list.add("HEAD" to "$webBase/${ref.owner}/${ref.repo}/archive/HEAD.zip")
@@ -291,6 +297,9 @@ class RepoDownloader(
         private const val META = "meta.properties"
         private const val SRC = "src"
         private const val MIN_FREE_BYTES = 20L * 1024 * 1024
+        private const val TMP_SEP = "~"
+        private val tmpCounter = java.util.concurrent.atomic.AtomicInteger()
+        private fun isTmpName(name: String) = name.endsWith(".zip.part") || name.endsWith(".staging")
 
         fun formatBytes(b: Long): String = when {
             b >= 1024L * 1024 * 1024 -> "%.1f GB".format(Locale.US, b / (1024.0 * 1024 * 1024))

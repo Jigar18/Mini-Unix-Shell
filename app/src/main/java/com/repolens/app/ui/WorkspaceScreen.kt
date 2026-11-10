@@ -83,11 +83,13 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -128,6 +130,7 @@ import com.repolens.app.core.Symbol
 import com.repolens.app.core.SymbolKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -151,7 +154,7 @@ fun WorkspaceScreen(vm: AppViewModel, ws: Workspace) {
         drawerState = drawerState,
         gesturesEnabled = drawerState.isOpen, // swiping inside the code must scroll it, not open the drawer
         drawerContent = {
-            FileDrawer(ws, open = drawerState.isOpen) { path ->
+            FileDrawer(ws, open = drawerState.isOpen || drawerState.targetValue == DrawerValue.Open) { path ->
                 vm.openFile(path, null)
                 scope.launch { drawerState.close() }
             }
@@ -332,6 +335,16 @@ private fun CodeHost(vm: AppViewModel, ws: Workspace, doc: OpenDoc, lines: List<
     val hasSelection = ws.selection != null
     val textSize = vm.textSizeSp
     val dark = RepoTheme.colors.isDark
+    val path by rememberUpdatedState(doc.path)
+    // The view model must not keep the view (and with it the activity and the last file's text)
+    // after the code view leaves the screen, e.g. when the repository is closed. Where it was
+    // scrolled to is remembered, for a code view created again after the activity is recreated.
+    DisposableEffect(Unit) {
+        onDispose {
+            holder.value?.let { v -> v.firstVisibleLine().takeIf { it >= 0 }?.let { ws.lastTop = path to it } }
+            vm.topLineProvider = { 0 }; holder.value = null
+        }
+    }
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
@@ -344,15 +357,18 @@ private fun CodeHost(vm: AppViewModel, ws: Workspace, doc: OpenDoc, lines: List<
                     override fun onBlankTapped() { vm.clearSelection(); v.clearSelection() }
                     override fun onTextSizeChanged(sp: Float) = vm.updateTextSize(sp)
                 }
+                ws.lastTop?.let { (p, line) -> if (p == doc.path) v.scrollToTopLine(line) }
+                ws.lastTop = null
             }
         },
         update = { v ->
+            v.contentDescription = "Code of ${doc.name}, ${lines.size} lines"
             v.setDarkTheme(dark)
             v.setTextSize(textSize)
             v.setContent(lines, lenses, wrap)
             if (!hasSelection && v.userSelection) v.clearSelection()
-            if (request != null && request.id != v.lastRequestId) {
-                v.lastRequestId = request.id
+            if (request != null && request.id != ws.appliedRequestId) {
+                ws.appliedRequestId = request.id
                 if (request.restoreTop) v.scrollToTopLine(request.line) else v.reveal(request.line, request.col, request.length)
             }
         },
@@ -434,18 +450,18 @@ private fun SelectionBar(vm: AppViewModel, ws: Workspace, modifier: Modifier) {
                     val pad = PaddingValues(horizontal = 12.dp)
                     if (s.site == null) {
                         Button(onClick = { vm.goToDefinition() }, enabled = s.indexReady && others > 0, modifier = m,
-                            colors = primaryButtonColors(), contentPadding = pad) { Text("Go to definition", maxLines = 1) }
+                            colors = primaryButtonColors(), contentPadding = pad) { Text("Go to definition", maxLines = 1, overflow = TextOverflow.Ellipsis) }
                         OutlinedButton(onClick = { vm.showReferencesForSelection() }, enabled = s.indexReady, modifier = m,
                             colors = secondaryButtonColors(), border = BorderStroke(1.dp, colors.outline), contentPadding = pad) {
-                            Text(if (s.definitions.isEmpty()) "Find usages" else "References" + (s.referenceCount?.let { " ($it)" } ?: ""), maxLines = 1)
+                            Text(if (s.definitions.isEmpty()) "Find usages" else "References" + (s.referenceCount?.let { " ($it)" } ?: ""), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     } else {
                         Button(onClick = { vm.showReferencesForSelection() }, modifier = m, colors = primaryButtonColors(), contentPadding = pad) {
-                            Text("Find references" + (s.referenceCount?.let { " ($it)" } ?: ""), maxLines = 1)
+                            Text("Find references" + (s.referenceCount?.let { " ($it)" } ?: ""), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         if (others > 0) OutlinedButton(onClick = { vm.goToDefinition() }, modifier = m, colors = secondaryButtonColors(),
                             border = BorderStroke(1.dp, colors.outline), contentPadding = pad) {
-                            Text(if (others == 1) "Other definition" else "$others others", maxLines = 1)
+                            Text(if (others == 1) "Other definition" else "$others others", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -462,7 +478,7 @@ private fun describe(s: WordSelection): String {
     }
     val d = s.definitions
     return when {
-        d.isEmpty() -> "Not defined in this repository — probably from a library or the language itself."
+        d.isEmpty() -> "No definition found in this repository: it may come from a library, or be a parameter or local variable."
         d.size == 1 -> "${d[0].kind.label.replaceFirstChar { it.uppercase() }} in ${d[0].file.path}:${d[0].line + 1}"
         else -> "${d.size} possible definitions · closest: ${d[0].file.path}:${d[0].line + 1}"
     }
@@ -583,6 +599,14 @@ private fun RefItemRow(item: RefItem, onClick: () -> Unit) {
 private class TreeNode(val name: String, val path: String, val isDir: Boolean)
 private class TreeRow(val node: TreeNode, val depth: Int)
 
+/** Above this many files the drawer's tree and filter are computed off the main thread. */
+internal const val INLINE_PATHS = 5000
+
+private fun filterPaths(paths: List<String>, q: String): List<String> =
+    paths.filter { it.contains(q, ignoreCase = true) }
+        .sortedWith(compareBy({ !it.substringAfterLast('/').contains(q, true) }, { it.length }))
+        .take(500)
+
 private fun buildTree(paths: List<String>): Map<String, List<TreeNode>> {
     val dirs = HashMap<String, MutableSet<String>>()
     val files = HashMap<String, MutableList<String>>()
@@ -606,7 +630,13 @@ private fun buildTree(paths: List<String>): Map<String, List<TreeNode>> {
 
 @Composable
 private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
-    val tree = remember(ws) { buildTree(ws.paths) }
+    // Small trees are built right away; a big one (up to 300k paths) only once the drawer is
+    // first opened, and off the main thread.
+    val small = ws.paths.size <= INLINE_PATHS
+    var tree by remember(ws) { mutableStateOf(if (small) buildTree(ws.paths) else null) }
+    LaunchedEffect(ws, open) {
+        if (open && tree == null) tree = withContext(Dispatchers.Default) { buildTree(ws.paths) }
+    }
     val expanded = remember(ws) { mutableStateMapOf<String, Boolean>() }
     var filter by remember { mutableStateOf("") }
     val current = ws.doc?.path
@@ -622,7 +652,7 @@ private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
         derivedStateOf {
             val out = ArrayList<TreeRow>()
             fun walk(dir: String, depth: Int) {
-                for (n in tree[dir].orEmpty()) {
+                for (n in tree?.get(dir).orEmpty()) {
                     out.add(TreeRow(n, depth))
                     if (n.isDir && expanded[n.path] == true) walk(n.path, depth + 1)
                 }
@@ -631,8 +661,8 @@ private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
             out
         }
     }
-    LaunchedEffect(open) {
-        if (open && filter.isEmpty()) {
+    LaunchedEffect(open, tree != null) {
+        if (open && tree != null && filter.isEmpty()) {
             val i = rows.indexOfFirst { it.node.path == current }
             if (i > 3) listState.scrollToItem(i - 3)
         }
@@ -665,7 +695,7 @@ private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = filter, onValueChange = { filter = it },
-                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    singleLine = true, modifier = Modifier.fillMaxWidth().testTag("fileFilter"),
                     shape = RoundedCornerShape(12.dp),
                     placeholder = { Text("Filter files", style = MaterialTheme.typography.bodyMedium) },
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono, color = colors.onSurface),
@@ -685,13 +715,17 @@ private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
             val rowShape = RoundedCornerShape(10.dp)
             if (filter.isNotBlank()) {
                 val q = filter.trim()
-                val matches = remember(q) {
-                    ws.paths.filter { it.contains(q, ignoreCase = true) }
-                        .sortedWith(compareBy({ !it.substringAfterLast('/').contains(q, true) }, { it.length }))
-                        .take(500)
+                // big repos: wait for typing to pause, then search off the main thread (the
+                // previous results stay on screen meanwhile)
+                var found by remember(ws) { mutableStateOf<List<String>?>(null) }
+                LaunchedEffect(ws, q) {
+                    if (small) return@LaunchedEffect
+                    delay(150)
+                    found = withContext(Dispatchers.Default) { filterPaths(ws.paths, q) }
                 }
+                val matches = if (small) remember(q) { filterPaths(ws.paths, q) } else found
                 LazyColumn(Modifier.fillMaxSize().navigationBarsPadding(), contentPadding = PaddingValues(vertical = 8.dp)) {
-                    items(matches) { p ->
+                    items(matches.orEmpty()) { p ->
                         val selected = p == current
                         Column(
                             Modifier.fillMaxWidth().padding(horizontal = 8.dp).clip(rowShape)
@@ -713,7 +747,7 @@ private fun FileDrawer(ws: Workspace, open: Boolean, onOpen: (String) -> Unit) {
                                 maxLines = 1, overflow = TextOverflow.StartEllipsis, modifier = Modifier.padding(start = 30.dp))
                         }
                     }
-                    if (matches.isEmpty()) item {
+                    if (matches?.isEmpty() == true) item {
                         Text("No matching files", style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant, modifier = Modifier.padding(20.dp))
                     }
                 }
@@ -765,7 +799,7 @@ private fun SymbolSearchDialog(vm: AppViewModel, ws: Workspace, onDismiss: () ->
     val index = ws.index
     LaunchedEffect(query, index) {
         delay(120)
-        results = if (index == null) emptyList() else withContext(Dispatchers.Default) { index.searchSymbols(query) }
+        results = if (index == null) emptyList() else withContext(Dispatchers.Default) { index.searchSymbols(query) { !isActive } }
     }
     LaunchedEffect(Unit) { focus.requestFocus() }
     val colors = MaterialTheme.colorScheme

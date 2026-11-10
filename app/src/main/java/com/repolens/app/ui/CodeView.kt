@@ -42,9 +42,6 @@ class CodeView(context: Context) : View(context) {
     var userSelection = false
         private set
 
-    /** Id of the last navigation request applied, so each one runs exactly once. */
-    var lastRequestId = -1L
-
     // ---------- content ----------
     private var lines: List<LexedLine> = emptyList()
     private var asciiLine = BooleanArray(0)
@@ -132,7 +129,7 @@ class CodeView(context: Context) : View(context) {
         wrap = wrapLines
         if (!sameDoc) {
             prefixCache.clear()
-            asciiLine = BooleanArray(lines.size) { i -> lines[i].text.all { it.code < 128 } }
+            asciiLine = BooleanArray(lines.size) { i -> lines[i].text.all { it.code in 32..126 } } // control chars (form feed…) get measured
             maxCols = lines.maxOfOrNull { it.text.length } ?: 0
             sx = 0f; sy = 0f
             scroller.forceFinished(true)

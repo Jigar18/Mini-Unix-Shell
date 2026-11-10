@@ -266,6 +266,18 @@ class RobustnessTest {
         assertTrue(vm.error!!, vm.error!!.contains("wasn't reopened automatically"))
     }
 
+    @Test fun sharingTextWithoutALinkKeepsTheOpenRepo() {
+        showApp(AppViewModel(app))
+        openRepo("demo/shop")
+        val ws = vm.workspace!!
+        vm.openShared("just some words")
+        compose.waitForIdle()
+        assertTrue("the open repository must stay open", vm.workspace === ws)
+        assertNull(vm.error)
+        vm.openShared("look: https://github.com/odd/files")
+        waitUntil("shared repo opened") { vm.workspace?.info?.ref?.fullName == "odd/files" && vm.workspace?.doc != null }
+    }
+
     @Test fun oddShareIntentsDontCrashTheActivity() {
         val intents = listOf(
             Intent(Intent.ACTION_SEND),

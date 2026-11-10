@@ -217,11 +217,47 @@ class DownloaderTest {
         server.bytes("/repos/o/r", """{"default_branch":"main"}""".toByteArray())
         server.slow("/o/r/zip/refs/heads/main", chunk = 64 * 1024, chunks = 200, delayMs = 20)
         val job = async { downloader().download(RepoRef("o", "r")) {} }
-        while (File(dir, "repos/o_r.zip.part").length() < 128 * 1024) delay(10)
+        while ((partFile("o_r")?.length() ?: 0) < 128 * 1024) delay(10)
         job.cancel()
         try { job.await(); fail("cancelled") } catch (e: kotlinx.coroutines.CancellationException) {}
         assertEquals(emptyList<File>(), leftovers())
         assertNull(downloader().cached(RepoRef("o", "r")))
+    }
+
+    private fun partFile(key: String) = File(dir, "repos").listFiles()?.firstOrNull { it.name.startsWith("$key~") && it.name.endsWith(".zip.part") }
+
+    /**
+     * Cancel, then open the same repository again while the cancelled download's thread is still
+     * blocked in a read: when that thread finally cleans up it must not delete the files of the
+     * download that replaced it (both used to be `o_r.zip.part`).
+     */
+    @Test fun aCancelledDownloadDoesNotDeleteTheFilesOfItsReplacement() = runBlocking {
+        server.bytes("/repos/o/r", """{"default_branch":"main"}""".toByteArray())
+        server.slow("/o/r/zip/refs/heads/main", chunk = 64 * 1024, chunks = 20, delayMs = 700)
+        val first = async(kotlinx.coroutines.Dispatchers.IO) { downloader().download(RepoRef("o", "r")) {} }
+        while (partFile("o_r") == null) delay(10)
+        first.cancel() // its thread stays blocked in read() for up to 700 ms
+        val zip = zipOf("r-main/a.kt" to "fun a() = 1\n".repeat(20_000))
+        server.slowBytes("/o/r/zip/refs/heads/main", zip, pieces = 10, delayMs = 150)
+        val info = downloader().download(RepoRef("o", "r")) {}
+        assertTrue(File(info.dir, "a.kt").isFile)
+        try { first.await() } catch (e: kotlinx.coroutines.CancellationException) {}
+        assertEquals(emptyList<File>(), leftovers())
+        assertNotNull(downloader().cached(RepoRef("o", "r")))
+    }
+
+    @Test fun deleteRemovesTheTemporaryFilesOfThatRepoOnly() {
+        File(dir, "repos/o_r~abc.staging/src").mkdirs()
+        File(dir, "repos/o_r~abc.zip.part").writeText("partial")
+        File(dir, "repos/o_rx~abc.zip.part").writeText("another repo")
+        downloader().delete(RepoRef("O", "R"))
+        assertEquals(listOf("o_rx~abc.zip.part"), leftovers().map { it.name })
+    }
+
+    /** GitHub: the API answers for an empty repository, but there is no archive of it. */
+    @Test fun emptyRepositoryIsReportedAsEmpty() {
+        server.bytes("/repos/o/r", """{"default_branch":"main"}""".toByteArray())
+        expectFailure(RepoRef("o", "r"), "This repository is empty")
     }
 
     @Test fun sweepRemovesLeftoversOfAKilledProcess() {

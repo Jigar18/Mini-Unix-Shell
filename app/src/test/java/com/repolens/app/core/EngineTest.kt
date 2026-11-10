@@ -82,6 +82,26 @@ class DefinitionFinderTest {
         assertTrue(d.none { it.endsWith(":ready") || it.endsWith(":start") || it.endsWith(":format") || it.endsWith(":compute") || it.endsWith(":println") || it.endsWith(":foo") })
     }
 
+    /** Spring/Lombok code is mostly fields: tapping one used to say "not defined in this repository". */
+    @Test fun javaFields() {
+        val d = defs(Languages.JAVA, """
+            public class UserService {
+                private final UserRepository userRepository;
+                @Id @GeneratedValue(strategy = GenerationType.IDENTITY) private Long id;
+                private static final Map<String, List<Integer>> CACHE = new HashMap<>();
+                protected transient String[] names;
+                private @Nullable String email;
+                public static void main(String[] args) {
+                private final String token(String raw) {
+                    final int n = 5;
+                    String plain = "x";
+                    return userRepository.save(user);
+            }
+        """)
+        assertHas(d, listOf("variable:userRepository", "variable:id", "variable:CACHE", "variable:names", "variable:email", "variable:n", "function:main", "function:token"))
+        assertNone(d, "plain", "save", "args", "raw", "void", "String")
+    }
+
     @Test fun cAndCpp() {
         val c = defs(Languages.C, """
             #include <stdio.h>
@@ -290,5 +310,107 @@ class LexerTest {
         assertEquals(TokenType.STRING, types["\"a(b\""])
         assertEquals(TokenType.TYPE, types["Bar"])
         assertEquals(TokenType.IDENT, types["baz"])
+    }
+}
+
+/** Reference counts and lenses on the user's real repository (Jigar18/Stratos, Java/Spring). */
+class StratosNavigationTest {
+    private lateinit var dir: File
+    private lateinit var index: SymbolIndex
+
+    @org.junit.Before fun setUp() {
+        dir = Files.createTempDirectory("stratos").toFile()
+        val zip = File(dir, "s.zip").apply { writeBytes(com.repolens.app.testing.MiniHttpServer.stratosZip()) }
+        RepoDownloader.unzipStrippingTopFolder(zip, File(dir, "src"))
+        index = runBlocking { SymbolIndex.build(File(dir, "src"), IndexLimits.forHeap()) }
+    }
+
+    @org.junit.After fun tearDown() { dir.deleteRecursively() }
+
+    private fun fn(name: String, file: String) =
+        index.definitionsInFile(file).single { it.name == name && it.kind == SymbolKind.FUNCTION }
+
+    @Test fun parametersNamedLikeAMethodDontCountAsItsReferences() {
+        // GithubClient.refreshToken(String refreshToken): the only calls are
+        // githubClient.refreshToken(…) and token.refreshToken() (a record accessor). The ~30
+        // uses of parameters/locals called refreshToken used to be counted too (33).
+        val m = fn("refreshToken", "auth_service/src/main/java/com/stratos/auth_service/client/GithubClient.java")
+        assertEquals(2, index.referenceCount(m))
+        assertEquals(2, index.referencesTo(m).size)
+        // status(): 3 calls of installation.status() + 4 ResponseEntity.status(…) library calls
+        // with the same name (can't be told apart without types); the local `String status`
+        // and the record component no longer count (was 12).
+        val status = fn("status", "auth_service/src/main/java/com/stratos/auth_service/dto/GithubInstallationDTO.java")
+        assertEquals(7, index.referenceCount(status))
+    }
+
+    @Test fun classesStillCountEveryUse() {
+        val user = index.definitionsInFile("auth_service/src/main/java/com/stratos/auth_service/model/User.java").single { it.name == "User" }
+        assertEquals(23, index.referenceCount(user))
+    }
+
+    @Test fun fieldsAreDefinitions() {
+        val us = "auth_service/src/main/java/com/stratos/auth_service/service/UserService.java"
+        val d = index.definitionsFor("userRepository", us, 19)
+        assertEquals("$d", 13, d.first().line)
+        assertEquals(SymbolKind.VARIABLE, d.first().kind)
+    }
+
+    @Test fun constructorsDontGetASecondLens() {
+        val us = "auth_service/src/main/java/com/stratos/auth_service/service/UserService.java"
+        val lenses = index.lensSymbols(us)
+        assertTrue(lenses.any { it.name == "UserService" && it.kind == SymbolKind.CLASS })
+        assertTrue("$lenses", lenses.none { it.name == "UserService" && it.kind == SymbolKind.FUNCTION })
+        assertTrue(lenses.any { it.name == "saveUser" })
+        // go-to-definition on `new UserService(…)` still finds the constructor
+        assertTrue(index.definitionsFor("UserService", us, 0).any { it.kind == SymbolKind.FUNCTION })
+    }
+}
+
+class CallSiteTest {
+    private fun call(line: String, word: String): Boolean {
+        val s = line.indexOf(word)
+        return SymbolIndex.isCallLike(line, s, s + word.length)
+    }
+
+    @Test fun recognisesCallsAndReferences() {
+        assertTrue(call("x = foo(1)", "foo"))
+        assertTrue(call("x = foo (1)", "foo"))
+        assertTrue(call("list.forEach { }", "forEach"))
+        assertTrue(call("val r = convert<Map<String, Int>>(x)", "convert"))
+        assertTrue(call("items.map(Foo::bar)", "bar"))
+        assertTrue(call("val f = ::bar", "bar"))
+        assertTrue(call("return <App />", "App"))
+        assertTrue(call("</App>", "App"))
+        assertTrue(!call("String refreshToken = x;", "refreshToken"))
+        assertTrue(!call("use(refreshToken)", "refreshToken"))
+        assertTrue(!call("if (a < b && c > (d)) {", "a"))
+        assertTrue(!call("this.status = status;", "status"))
+    }
+
+    @Test fun packingKeepsFieldsApart() {
+        val p = SymbolIndex.pack(40_000, SymbolIndex.MAX_PACKED_LINE, SymbolIndex.MAX_PACKED_COL)
+        assertEquals(40_000, SymbolIndex.unpackFile(p))
+        assertEquals(SymbolIndex.MAX_PACKED_LINE, SymbolIndex.unpackLine(p))
+        assertEquals(SymbolIndex.MAX_PACKED_COL, SymbolIndex.unpackCol(p))
+        assertTrue(!SymbolIndex.isCallSite(p))
+        assertTrue(SymbolIndex.isCallSite(p or 1L))
+        assertEquals(SymbolIndex.MAX_PACKED_COL, SymbolIndex.unpackCol(p or 1L))
+    }
+
+    @Test fun symbolSearchCanBeCancelled() {
+        val dir = Files.createTempDirectory("search").toFile()
+        try {
+            File(dir, "A.kt").writeText((0 until 3000).joinToString("\n") { "fun f$it() = $it" })
+            val index = runBlocking { SymbolIndex.build(dir) }
+            assertTrue(index.searchSymbols("f1").isNotEmpty())
+            try {
+                index.searchSymbols("f1") { true }
+                org.junit.Assert.fail("expected cancellation")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 }

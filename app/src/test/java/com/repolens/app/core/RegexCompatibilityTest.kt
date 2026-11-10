@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
  * These tests check every regex the app compiles against ICU's rules.
  */
 class RegexCompatibilityTest {
-    private val all: List<String> = Languages.allPatterns + DefinitionFinder.allPatterns + RepoRef.allPatterns
+    private val all: List<String> = Languages.allPatterns + DefinitionFinder.allPatterns + RepoRef.allPatterns + com.repolens.app.CrashStore.allPatterns
 
     /** The two patterns as they were in 1.0.0 (crashed on Android). */
     private val oldBroken = listOf("""^\s*}\s*([A-Za-z_][A-Za-z0-9_]*)\s*;""", """^\s*typedef\b.*}\s*([A-Za-z_][A-Za-z0-9_]*)\s*;""")

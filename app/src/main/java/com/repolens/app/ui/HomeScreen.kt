@@ -1,5 +1,6 @@
 package com.repolens.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -86,6 +87,8 @@ fun HomeScreen(vm: AppViewModel) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val busy = vm.busyMessage != null
     val colors = MaterialTheme.colorScheme
+    // Back while a repository is downloading cancels the download instead of leaving the app.
+    BackHandler(enabled = busy) { vm.cancelOpen() }
 
     Surface(color = colors.background, contentColor = colors.onBackground, modifier = Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing), contentAlignment = Alignment.TopCenter) {
@@ -345,7 +348,7 @@ private fun RecentRow(vm: AppViewModel, r: RecentRepo, enabled: Boolean) {
                 DropdownMenuItem(
                     text = { Text("Download latest") },
                     leadingIcon = { Icon(Icons.Default.Refresh, null) },
-                    onClick = { menu = false; vm.input = "https://github.com/${r.fullName}"; vm.open(refresh = true) },
+                    onClick = { menu = false; vm.refreshRecent(r) },
                 )
                 DropdownMenuItem(
                     text = { Text("Remove") },

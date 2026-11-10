@@ -80,6 +80,14 @@ class Workspace(val info: RepoInfo, val paths: List<String>) {
     var selection by mutableStateOf<WordSelection?>(null)
     var sheet by mutableStateOf<NavSheet?>(null)
     var viewRequest by mutableStateOf<ViewRequest?>(null)
+    /**
+     * The last [viewRequest] the code view applied. Kept here, not in the view, so a code view
+     * created again (the activity was recreated for a font-scale or locale change) doesn't
+     * apply it a second time and jump away from where the user was reading.
+     */
+    var appliedRequestId = -1L
+    /** Where the code view was when it went away (path and first visible line), to restore it. */
+    var lastTop: Pair<String, Int>? = null
     var message by mutableStateOf<String?>(null)
     val history = mutableStateListOf<Location>()
 }
@@ -211,13 +219,40 @@ class AppViewModel(app: Application, private val saved: SavedStateHandle) : Andr
             saved[KEY_REPO] = info.ref.fullName
             CrashReporter.breadcrumb(getApplication(), "Browsing ${info.ref.fullName}")
             startIndexing(ws)
+            // a /blob/feature/x/src/A.kt link parses as ref "feature" + path "x/src/A.kt"; the
+            // branch turned out to be "feature/x", so the file is src/A.kt
+            val linked = ref.path?.let { p -> listOfNotNull(ref.ref, p).joinToString("/").removePrefix(info.branch + "/") }
             val first = restoreFile?.takeIf { it in paths }
+                ?: linked?.takeIf { it in paths }
                 ?: ref.path?.takeIf { it in paths }
                 ?: paths.firstOrNull { it.equals("README.md", true) }
                 ?: paths.firstOrNull { it.startsWith("README", true) && '/' !in it }
                 ?: paths.first()
             openFile(first, null, pushHistory = false)
         }
+    }
+
+    /**
+     * "Share → RepoLens". Only a text containing a GitHub repository link replaces what is open:
+     * sharing anything else must not close the repository the user is reading.
+     */
+    fun openShared(text: String) {
+        val link = text.take(4000)
+        val ref = try { RepoRef.parse(link) } catch (e: Exception) { null }
+        val ws = workspace
+        if (ref == null && ws != null) {
+            ws.message = "The shared text doesn't contain a GitHub repository link."
+            return
+        }
+        input = link
+        if (ref != null) closeRepo()
+        open(link)
+    }
+
+    /** "Download latest" of a recent repository: the branch it was opened at, not the default one. */
+    fun refreshRecent(r: RecentRepo) {
+        val branch = r.branch.takeIf { it.isNotBlank() && it != "HEAD" }
+        open("https://github.com/${r.fullName}" + (branch?.let { "/tree/$it" } ?: ""), refresh = true)
     }
 
     fun cancelOpen() {
@@ -312,8 +347,7 @@ class AppViewModel(app: Application, private val saved: SavedStateHandle) : Andr
             val (labels, syms) = withContext(Dispatchers.Default) {
                 val labels = HashMap<Int, String>()
                 val syms = HashMap<Int, Symbol>()
-                for (s in index.definitionsInFile(doc.path)) {
-                    if (!s.kind.showsReferenceLens || syms.containsKey(s.line)) continue
+                for (s in index.lensSymbols(doc.path)) {
                     val n = index.referenceCount(s)
                     labels[s.line] = if (n == 1) "1 reference" else "$n references"
                     syms[s.line] = s
@@ -420,7 +454,7 @@ class AppViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 },
                 definitions = defFiles,
                 folders = folders,
-                note = if (textSearch) "“$word” isn't defined in this repo (probably comes from a library), so these are text matches." else null,
+                note = if (textSearch) "No definition of “$word” was found in this repo (a library name, parameter or local variable?), so these are text matches." else null,
             )
         }
     }
