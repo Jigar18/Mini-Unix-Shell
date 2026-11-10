@@ -12,6 +12,8 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.OverScroller
+import androidx.core.content.res.ResourcesCompat
+import com.repolens.app.R
 import com.repolens.app.core.LexedLine
 import com.repolens.app.core.TokenType
 import kotlin.math.abs
@@ -47,6 +49,9 @@ class CodeView(context: Context) : View(context) {
     private var asciiLine = BooleanArray(0)
     private var lenses: Map<Int, String> = emptyMap()
     private var maxCols = 0
+    /** Widest line in px at [widestAtPx] text size, measured lazily when the font isn't fixed-pitch; -1 = not measured. */
+    private var widestPx = -1f
+    private var widestAtPx = 0f
 
     // ---------- rows ----------
     private var rowCount = 0
@@ -68,19 +73,31 @@ class CodeView(context: Context) : View(context) {
     var wrap = false
         private set
 
-    private val codePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = Typeface.MONOSPACE }
-    /** Always upright monospace, so measurements don't depend on what was drawn last. */
-    private val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = Typeface.MONOSPACE }
+    /**
+     * The bundled JetBrains Mono, so code never depends on the device's fonts: some phones map
+     * Typeface.MONOSPACE to a proportional font. Ligatures are off so `!=`, `->`… read as typed.
+     */
+    private var codeFace: Typeface = loadCodeTypeface(context)
+    private val codePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = codeFace; fontFeatureSettings = NO_LIGATURES }
+    /** Always upright, so measurements don't depend on what was drawn last. */
+    private val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply { typeface = codeFace; fontFeatureSettings = NO_LIGATURES }
 
     /**
-     * x offset of every column of recently drawn non-ASCII lines (emoji, CJK, combining marks…),
+     * True when every character is [charW] wide, so ASCII lines can sit on a column grid. If the
+     * font turns out not to be fixed-pitch (it failed to load and the fallback is proportional),
+     * every line goes through the measured path instead.
+     */
+    var isFixedPitch = true
+        private set
+
+    /**
+     * x offset of every column of recently drawn measured lines (non-ASCII ones, or all when not [isFixedPitch]),
      * so drawing and hit-testing them is O(log n) instead of measuring the line again and again.
      */
     private val prefixCache = object : LinkedHashMap<Int, FloatArray>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, FloatArray>?) = size > 256
     }
-    private val italicFace = Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
-    private val gutterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE; textAlign = Paint.Align.RIGHT }
+    private val gutterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = codeFace; textAlign = Paint.Align.RIGHT }
     private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT }
     private val fill = Paint()
     private val rect = RectF()
@@ -131,6 +148,7 @@ class CodeView(context: Context) : View(context) {
             prefixCache.clear()
             asciiLine = BooleanArray(lines.size) { i -> lines[i].text.all { it.code in 32..126 } } // control chars (form feed…) get measured
             maxCols = lines.maxOfOrNull { it.text.length } ?: 0
+            widestPx = -1f
             sx = 0f; sy = 0f
             scroller.forceFinished(true)
             clearSelection()
@@ -156,6 +174,7 @@ class CodeView(context: Context) : View(context) {
         if (sp.isNaN() || abs(sp - textSizeSp) < 0.01f) return
         val top = firstVisibleLine()
         applyTextSize(sp)
+        widestPx = -1f
         rebuildRows()
         if (top >= 0 && top < firstRowOfLine.size) sy = rowTop[firstRowOfLine[top]]
         clampScroll()
@@ -165,13 +184,20 @@ class CodeView(context: Context) : View(context) {
     /** Text size at which ~90% of this file's lines fit the screen width without scrolling. */
     fun fitTextSize(): Float {
         if (lines.isEmpty() || width == 0) return textSizeSp
-        val lengths = lines.map { it.text.trimEnd().length }.filter { it > 0 }.sorted()
-        if (lengths.isEmpty()) return textSizeSp
-        val p90 = lengths[(lengths.size * 0.9).toInt().coerceAtMost(lengths.size - 1)].coerceAtLeast(40)
         val available = width - gutterW - padL - padR
-        val perCharPx = available / p90
-        // charW is proportional to text size
-        val sp = textSizeSp * (perCharPx / charW)
+        val sp = if (isFixedPitch) {
+            val lengths = lines.map { it.text.trimEnd().length }.filter { it > 0 }.sorted()
+            if (lengths.isEmpty()) return textSizeSp
+            val p90 = lengths[(lengths.size * 0.9).toInt().coerceAtMost(lengths.size - 1)].coerceAtLeast(40)
+            val perCharPx = available / p90
+            // charW is proportional to text size
+            textSizeSp * (perCharPx / charW)
+        } else {
+            val widths = lines.map { measurePaint.measureText(it.text.trimEnd()) }.filter { it > 0f }.sorted()
+            if (widths.isEmpty()) return textSizeSp
+            val p90 = widths[(widths.size * 0.9).toInt().coerceAtMost(widths.size - 1)].coerceAtLeast(40 * measurePaint.measureText("x"))
+            textSizeSp * (available / p90)
+        }
         return sp.coerceIn(MIN_SP, 14f)
     }
 
@@ -203,7 +229,7 @@ class CodeView(context: Context) : View(context) {
         if (!wrap && l < lines.size) {
             val x = xOfCol(l, col)
             val viewW = width - gutterW
-            if (x - sx < 0 || x + length * charW - sx > viewW - padR) sx = max(0f, x - viewW * 0.25f)
+            if (x - sx < 0 || xOfCol(l, col + length) - sx > viewW - padR) sx = max(0f, x - viewW * 0.25f)
         }
         clampScroll()
         flashLine = l
@@ -231,7 +257,8 @@ class CodeView(context: Context) : View(context) {
     fun pointFor(line: Int, col: Int): android.graphics.PointF {
         if (line !in lines.indices) return android.graphics.PointF(-1f, -1f)
         val r = firstRowOfLine[line]
-        return android.graphics.PointF(gutterW + padL - sx + xOfCol(line, col) + charW / 2, rowTop[r] - sy + lineH / 2)
+        val x = if (col in 0 until lines[line].text.length) (xOfCol(line, col) + xOfCol(line, col + 1)) / 2 else xOfCol(line, col) + charW / 2
+        return android.graphics.PointF(gutterW + padL - sx + x, rowTop[r] - sy + lineH / 2)
     }
 
     /** Screen position of the lens above [line], for tests. */
@@ -243,6 +270,29 @@ class CodeView(context: Context) : View(context) {
         return android.graphics.PointF(gutterW + padL - sx + xOfCol(line, indent) + charW * 2, rowTop[r] - sy + lensH / 2)
     }
 
+    /** Uses [face] for code instead of the bundled font, as if loading it had failed; for tests. */
+    internal fun setCodeTypeface(face: Typeface) {
+        codeFace = face
+        codePaint.typeface = face
+        measurePaint.typeface = face
+        gutterPaint.typeface = face
+        applyTextSize(textSizeSp)
+        widestPx = -1f
+        rebuildRows()
+        clampScroll()
+        invalidate()
+    }
+
+    internal val codeTypeface: Typeface get() = codeFace
+    internal val codeTextSizePx: Float get() = codePaint.textSize
+    /** Screen x of column 0 of an unwrapped line, for tests. */
+    internal val textOriginX: Float get() = gutterW + padL - sx
+    /** x of [col] relative to the start of [line] (unwrapped), for tests. */
+    internal fun xForColumn(line: Int, col: Int): Float = xOfCol(line, col)
+    internal val horizontalScrollRange: Float get() = maxScrollX()
+    internal val textLeftPx: Float get() = gutterW + padL
+    internal val textRightPadPx: Float get() = padR
+
     // ================= layout =================
 
     private fun applyTextSize(sp: Float) {
@@ -252,6 +302,7 @@ class CodeView(context: Context) : View(context) {
         measurePaint.textSize = px
         prefixCache.clear()
         charW = codePaint.measureText("M").takeIf { it > 0f } ?: (px * 0.6f).coerceAtLeast(1f)
+        isFixedPitch = PITCH_PROBES.all { abs(measurePaint.measureText(it) - charW * it.length) <= charW * 0.002f }
         val fm = codePaint.fontMetrics
         val textH = fm.descent - fm.ascent
         lineH = (textH * 1.32f).roundToInt().toFloat()
@@ -275,14 +326,18 @@ class CodeView(context: Context) : View(context) {
         gutterW = gutterPaint.measureText("0") * (digits + 1.6f)
     }
 
+    private fun wrapWidth(): Float = width - gutterW - padL - padR * 0.4f
+
     private fun wrapCols(): Int {
-        val w = width - gutterW - padL - padR * 0.4f
+        val w = wrapWidth()
         return if (w <= 0 || charW <= 0) 80 else max(20, (w / charW).toInt())
     }
 
     private fun rebuildRows() {
         val n = lines.size
         val cols = if (wrap) wrapCols() else Int.MAX_VALUE
+        // without a fixed-pitch font, wrap by measured width (at least as wide as 20 'M's, like wrapCols)
+        val wrapPx = if (wrap && !isFixedPitch) (if (wrapWidth() > 0) max(wrapWidth(), 20 * charW) else 80 * charW) else 0f
         var cap = n + lenses.size + 8
         var line = IntArray(cap); var start = IntArray(cap); var end = IntArray(cap)
         firstRowOfLine = IntArray(n)
@@ -298,6 +353,26 @@ class CodeView(context: Context) : View(context) {
             if (lenses.containsKey(i)) add(i, -1, -1)
             firstRowOfLine[i] = count
             val len = lines[i].text.length
+            if (wrap && !isFixedPitch) {
+                if (len == 0) { add(i, 0, 0); continue }
+                val text = lines[i].text
+                val p = measuredPrefix(text)
+                if (p[len] <= wrapPx) { add(i, 0, len); continue }
+                var s = 0
+                while (s < len) {
+                    // longest segment that fits, then break after the last space/punctuation in its final quarter
+                    var e = s + 1
+                    while (e < len && p[e + 1] - p[s] <= wrapPx) e++
+                    if (e < len) {
+                        var k = e
+                        while (k > s + 1 && p[k] - p[s] > wrapPx * 0.75f && !text[k - 1].isWhitespace() && text[k - 1] !in ",;(){}[]") k--
+                        if (k > s + 1 && p[k] - p[s] > wrapPx * 0.75f) e = k
+                    }
+                    add(i, s, e)
+                    s = e
+                }
+                continue
+            }
             if (!wrap || len <= cols) { add(i, 0, len); continue }
             var s = 0
             val text = lines[i].text
@@ -338,7 +413,18 @@ class CodeView(context: Context) : View(context) {
     }
 
     private fun maxScrollX(): Float =
-        if (wrap) 0f else max(0f, gutterW + padL + maxCols * charW + padR - width)
+        if (wrap) 0f else max(0f, gutterW + padL + contentWidth() + padR - width)
+
+    /** Width of the widest line: [maxCols] columns on a fixed-pitch grid, else measured (and rescaled while pinching). */
+    private fun contentWidth(): Float {
+        if (isFixedPitch) return maxCols * charW
+        val px = codePaint.textSize
+        if (widestPx < 0f) {
+            widestPx = lines.maxOfOrNull { measurePaint.measureText(it.text) } ?: 0f
+            widestAtPx = px
+        }
+        return if (widestAtPx > 0f) widestPx * (px / widestAtPx) else widestPx
+    }
 
     private fun maxScrollY(): Float = max(0f, contentHeight + bottomPad - height)
 
@@ -358,24 +444,28 @@ class CodeView(context: Context) : View(context) {
         return lo
     }
 
-    private fun prefix(line: Int): FloatArray = prefixCache.getOrPut(line) {
-        val text = lines[line].text
+    private fun prefix(line: Int): FloatArray = prefixCache.getOrPut(line) { measuredPrefix(lines[line].text) }
+
+    private fun measuredPrefix(text: String): FloatArray {
         val widths = FloatArray(text.length)
         if (text.isNotEmpty()) measurePaint.getTextWidths(text, 0, text.length, widths)
         val p = FloatArray(text.length + 1)
         for (i in widths.indices) p[i + 1] = p[i] + widths[i].coerceAtLeast(0f)
-        p
+        return p
     }
+
+    /** True when [line] can be laid out on the `col * charW` grid instead of being measured. */
+    private fun onGrid(line: Int) = isFixedPitch && asciiLine[line]
 
     private fun xOfCol(line: Int, col: Int): Float {
         val text = lines[line].text
         val c = col.coerceIn(0, text.length)
-        return if (asciiLine[line]) c * charW else prefix(line)[c]
+        return if (onGrid(line)) c * charW else prefix(line)[c]
     }
 
     private fun colAtX(line: Int, x: Float): Int {
         val text = lines[line].text
-        if (asciiLine[line]) return (x / charW).toInt().coerceIn(0, text.length)
+        if (onGrid(line)) return (x / charW).toInt().coerceIn(0, text.length)
         val p = prefix(line)
         // first column whose middle is right of x
         var lo = 0
@@ -458,7 +548,7 @@ class CodeView(context: Context) : View(context) {
         val segStart = rowStart[r]
         val segEnd = rowEnd[r]
         // x of column c on screen
-        val ascii = asciiLine[line]
+        val ascii = onGrid(line)
         val segX = if (wrap) xOfCol(line, segStart) else 0f
         val baseX = gutterW + padL - sx - segX
         val y = top + baseline
@@ -470,7 +560,7 @@ class CodeView(context: Context) : View(context) {
             visEnd = min(segEnd, ((sx + width) / charW).toInt() + 2)
             if (visStart >= visEnd) return
         } else if (!wrap && segEnd - segStart > 256) {
-            // long non-ASCII line: only draw the part that is on screen
+            // long measured line: only draw the part that is on screen
             visStart = max(segStart, colAtX(line, sx - padL) - 2)
             visEnd = min(segEnd, colAtX(line, sx + width) + 2)
             if (visStart >= visEnd) return
@@ -523,7 +613,8 @@ class CodeView(context: Context) : View(context) {
         while (k < e && text[k] == ' ') k++
         if (k == e) return
         codePaint.color = color
-        codePaint.typeface = if (italic) italicFace else Typeface.MONOSPACE
+        // synthesised italic: same advances as upright, so runs stay where they were measured
+        codePaint.textSkewX = if (italic) -0.2f else 0f
         canvas.drawText(text, k, e, baseX + xOfCol(line, k), y, codePaint)
     }
 
@@ -620,6 +711,8 @@ class CodeView(context: Context) : View(context) {
         }
 
         override fun onScaleEnd(detector: ScaleGestureDetector) {
+            widestPx = -1f // re-measure exactly instead of the rescaled estimate used while pinching
+            clampScroll(); invalidate()
             listener?.onTextSizeChanged(textSizeSp)
         }
     })
@@ -685,6 +778,17 @@ class CodeView(context: Context) : View(context) {
         const val MIN_SP = 6f
         const val MAX_SP = 30f
         private const val FLASH_MS = 1400L
+        private const val NO_LIGATURES = "'calt' 0, 'liga' 0"
+        /** Equal widths for all of these (per character) means the font is fixed-pitch. */
+        private val PITCH_PROBES = arrayOf("iiii", "MMMM", "0000", "    ", "_.,;", "lWm|")
+
+        /** The bundled monospace font, or the system one if it can't be loaded. */
+        fun loadCodeTypeface(context: Context): Typeface =
+            try {
+                ResourcesCompat.getFont(context, R.font.jetbrains_mono_regular) ?: Typeface.MONOSPACE
+            } catch (e: Exception) {
+                Typeface.MONOSPACE
+            }
     }
 }
 

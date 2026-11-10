@@ -25,6 +25,8 @@ Each push to the default branch builds an APK and publishes it under **Releases*
 | Canvas-drawn code view: two-axis scrolling, pinch zoom, fixed line numbers, reference links | `ui/CodeView.kt` |
 | Screens (Jetpack Compose) | `ui/HomeScreen.kt`, `ui/WorkspaceScreen.kt` |
 
+Code is shown in the bundled **JetBrains Mono** (`app/src/main/res/font/jetbrains_mono_regular.ttf`, © 2020 The JetBrains Mono Project Authors, [SIL Open Font License 1.1](licenses/JetBrainsMono-OFL.txt)) rather than the phone's monospace font, which some devices replace with a proportional one. If the font can't be loaded and the fallback isn't fixed-pitch, the code view measures every line instead of assuming a character grid.
+
 Navigation is **search-based**, like GitHub's own code navigation and ctags, not a compiler. Every file gets the same per-language rules, so it works for any language and is fast enough to index a whole repo on a phone. The trade-offs:
 
 - If two unrelated classes both define `save()`, "Go to definition" lists both and ranks the one in the same file or nearest folder first. A library call with the same name as a method in the repo (e.g. `ResponseEntity.status(...)` vs. your own `status()`) is treated as a use of the repo's method.

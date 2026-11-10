@@ -80,8 +80,8 @@ class AuditFixesTest {
 
     @Test fun versionIsBumpedSoCrashReportsTellBuildsApart() {
         val info = app.packageManager.getPackageInfo(app.packageName, 0)
-        assertEquals("1.1.0", info.versionName)
-        @Suppress("DEPRECATION") assertEquals(2, info.versionCode)
+        assertEquals("1.1.1", info.versionName)
+        @Suppress("DEPRECATION") assertEquals(3, info.versionCode)
     }
 
     @Test fun backOnHomeWhileDownloadingCancelsTheDownload() {

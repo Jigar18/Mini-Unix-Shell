@@ -18,14 +18,20 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.repolens.app.R
 import com.repolens.app.core.Family
 import com.repolens.app.core.Languages
 
-val Mono = FontFamily.Monospace
+/**
+ * The bundled JetBrains Mono (licenses/JetBrainsMono-OFL.txt), also used by [CodeView]: some phones
+ * map the system monospace family to a proportional font. Bold weights are synthesised.
+ */
+val Mono = FontFamily(Font(R.font.jetbrains_mono_regular))
 
 // ------------------------------------------------------------------ colour scheme
 //
