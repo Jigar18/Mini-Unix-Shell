@@ -1,6 +1,7 @@
 package com.repolens.app.ui
 
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
@@ -61,6 +62,10 @@ class CodeView(context: Context) : View(context) {
 
     // ---------- appearance ----------
     private val density = resources.displayMetrics.density
+
+    /** Light or dark editor colours; the Compose host keeps this in step with the app theme. */
+    var palette: Palette = if ((resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES) Palette.Dark else Palette.Light
+        private set
     var textSizeSp = 11f
         private set
     var wrap = false
@@ -139,6 +144,14 @@ class CodeView(context: Context) : View(context) {
             sy = rowTop[firstRowOfLine[topLine]] + topOffset
             clampScroll()
         }
+        invalidate()
+    }
+
+    /** Switches between the light and dark palette and redraws. */
+    fun setDarkTheme(dark: Boolean) {
+        val p = if (dark) Palette.Dark else Palette.Light
+        if (p === palette) return
+        palette = p
         invalidate()
     }
 
@@ -380,7 +393,9 @@ class CodeView(context: Context) : View(context) {
     // ================= drawing =================
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawColor(Palette.BG)
+        // fill only our bounds: drawColor() would paint the whole canvas when the host doesn't clip us
+        fill.color = palette.bg; fill.alpha = 255
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fill)
         if (rowCount == 0) return
         val h = height
         val first = rowAt(sy)
@@ -397,8 +412,12 @@ class CodeView(context: Context) : View(context) {
             if (rowStart[r] < 0) {
                 drawLens(canvas, line, top)
             } else {
+                if (line == selLine) {
+                    fill.color = palette.currentLine; fill.alpha = 255
+                    canvas.drawRect(codeLeft, top, width.toFloat(), top + lineH, fill)
+                }
                 if (flashAlpha > 0f && line == flashLine) {
-                    fill.color = Palette.FLASH; fill.alpha = (flashAlpha * 255).toInt()
+                    fill.color = palette.flash; fill.alpha = (flashAlpha * 255).toInt()
                     canvas.drawRect(codeLeft, top, width.toFloat(), top + lineH, fill)
                 }
                 drawCodeRow(canvas, r, line, top)
@@ -408,16 +427,16 @@ class CodeView(context: Context) : View(context) {
         canvas.restore()
 
         // gutter
-        fill.color = Palette.GUTTER_BG; fill.alpha = 255
+        fill.color = palette.gutterBg; fill.alpha = 255
         canvas.drawRect(0f, 0f, gutterW, h.toFloat(), fill)
-        fill.color = Palette.GUTTER_LINE
+        fill.color = palette.gutterLine
         canvas.drawRect(gutterW - density, 0f, gutterW, h.toFloat(), fill)
         r = first
         val numX = gutterW - gutterPaint.measureText("0") * 0.7f
         while (r < rowCount && rowTop[r] - sy < h) {
             if (rowStart[r] == 0) {
                 val line = rowLine[r]
-                gutterPaint.color = if (line == selLine || line == flashLine && flashAlpha > 0) Palette.LINE_NO_ACTIVE else Palette.LINE_NO
+                gutterPaint.color = if (line == selLine || line == flashLine && flashAlpha > 0) palette.lineNoActive else palette.lineNo
                 canvas.drawText((line + 1).toString(), numX, rowTop[r] - sy + baseline, gutterPaint)
             }
             r++
@@ -432,7 +451,7 @@ class CodeView(context: Context) : View(context) {
         val text = lines[line].text
         val indent = text.length - text.trimStart().length
         val x = gutterW + padL - sx + xOfCol(line, indent)
-        lensPaint.color = Palette.LENS
+        lensPaint.color = palette.lens
         canvas.drawText(label, x, top + lensBaseline, lensPaint)
     }
 
@@ -469,13 +488,13 @@ class CodeView(context: Context) : View(context) {
                 if (s >= visEnd) break
                 if (e - s == hw.length && TokenType.isIdentifier(lexed.type(i)) && text.regionMatches(s, hw, 0, hw.length)) {
                     val sel = line == selLine && s == selStart
-                    fill.color = if (sel) Palette.SELECTION else Palette.OCCURRENCE; fill.alpha = 255
+                    fill.color = if (sel) palette.selection else palette.occurrence; fill.alpha = 255
                     rect.set(baseX + xOfCol(line, s) - 1, top + 1, baseX + xOfCol(line, e) + 1, top + lineH - 1)
                     canvas.drawRoundRect(rect, 3 * density, 3 * density, fill)
                 }
             }
         } else if (line == selLine && selEnd > segStart && selStart < segEnd) {
-            fill.color = Palette.SELECTION; fill.alpha = 255
+            fill.color = palette.selection; fill.alpha = 255
             rect.set(baseX + xOfCol(line, selStart) - 1, top + 1, baseX + xOfCol(line, selEnd) + 1, top + lineH - 1)
             canvas.drawRoundRect(rect, 3 * density, 3 * density, fill)
         }
@@ -486,16 +505,16 @@ class CodeView(context: Context) : View(context) {
             if (te <= visStart) continue
             if (ts >= visEnd) break
             val s = max(ts, visStart); val e = min(te, visEnd)
-            if (s > pos) drawRun(canvas, text, line, pos, s, baseX, y, Palette.TEXT, false)
+            if (s > pos) drawRun(canvas, text, line, pos, s, baseX, y, palette.text, false)
             val type = lexed.type(i)
-            drawRun(canvas, text, line, s, e, baseX, y, Palette.colorOf(type), type == TokenType.COMMENT)
+            drawRun(canvas, text, line, s, e, baseX, y, palette.colorOf(type), type == TokenType.COMMENT)
             pos = e
         }
-        if (pos < visEnd) drawRun(canvas, text, line, pos, visEnd, baseX, y, Palette.TEXT, false)
+        if (pos < visEnd) drawRun(canvas, text, line, pos, visEnd, baseX, y, palette.text, false)
 
         if (wrap && segStart > 0) {
             // continuation marker in the left padding
-            lensPaint.color = Palette.LINE_NO
+            lensPaint.color = palette.lineNo
             canvas.drawText("↪", gutterW + padL * 0.1f, y, lensPaint)
         }
     }
@@ -517,7 +536,7 @@ class CodeView(context: Context) : View(context) {
         if (total > viewH * 1.05f) {
             val thumbH = max(32 * density, viewH * viewH / total)
             val t = sy / max(1f, maxScrollY()) * (viewH - thumbH)
-            fill.color = Palette.SCROLLBAR; fill.alpha = 255
+            fill.color = palette.scrollbar
             rect.set(width - 4 * density, t, width - 1.5f * density, t + thumbH)
             canvas.drawRoundRect(rect, 2 * density, 2 * density, fill)
         }
@@ -527,7 +546,7 @@ class CodeView(context: Context) : View(context) {
             val contentW = viewW + maxX
             val thumbW = max(32 * density, viewW * viewW / contentW)
             val l = gutterW + sx / maxX * (viewW - thumbW)
-            fill.color = Palette.SCROLLBAR
+            fill.color = palette.scrollbar
             rect.set(l, viewH - 4 * density, l + thumbW, viewH - 1.5f * density)
             canvas.drawRoundRect(rect, 2 * density, 2 * density, fill)
         }
@@ -672,37 +691,92 @@ class CodeView(context: Context) : View(context) {
     }
 }
 
-/** Dark editor colours. */
-object Palette {
-    const val BG = 0xFF1B1D23.toInt()
-    const val GUTTER_BG = 0xFF1B1D23.toInt()
-    const val GUTTER_LINE = 0xFF2A2E36.toInt()
-    const val LINE_NO = 0xFF4B5263.toInt()
-    const val LINE_NO_ACTIVE = 0xFFABB2BF.toInt()
-    const val TEXT = 0xFFC8CDD5.toInt()
-    const val KEYWORD = 0xFFC678DD.toInt()
-    const val TYPE = 0xFFE5C07B.toInt()
-    const val FUNCTION = 0xFF61AFEF.toInt()
-    const val STRING = 0xFF98C379.toInt()
-    const val NUMBER = 0xFFD19A66.toInt()
-    const val COMMENT = 0xFF7F848E.toInt()
-    const val ANNOTATION = 0xFFE06C75.toInt()
-    const val IDENT = 0xFFD7DAE0.toInt()
-    const val SELECTION = 0xFF3E4F6E.toInt()
-    const val OCCURRENCE = 0xFF333A47.toInt()
-    const val FLASH = 0xFF2F3A4F.toInt()
-    const val LENS = 0xFF8A94A6.toInt()
-    const val SCROLLBAR = 0x55FFFFFF
-
+/**
+ * Editor colours. Every token colour is at least 4.5:1 against [bg] and [currentLine], identifier
+ * colours stay at least 4.5:1 on [selection]/[occurrence], and line numbers at least 3:1 (see ContrastTest).
+ */
+class Palette(
+    val name: String,
+    val bg: Int,
+    val gutterBg: Int,
+    val gutterLine: Int,
+    val lineNo: Int,
+    val lineNoActive: Int,
+    val text: Int,
+    val ident: Int,
+    val keyword: Int,
+    val type: Int,
+    val function: Int,
+    val string: Int,
+    val number: Int,
+    val comment: Int,
+    val annotation: Int,
+    val lens: Int,
+    val selection: Int,
+    val occurrence: Int,
+    val flash: Int,
+    val currentLine: Int,
+    val scrollbar: Int,
+) {
     fun colorOf(type: Int) = when (type) {
-        TokenType.KEYWORD -> KEYWORD
-        TokenType.TYPE -> TYPE
-        TokenType.FUNCTION -> FUNCTION
-        TokenType.STRING -> STRING
-        TokenType.NUMBER -> NUMBER
-        TokenType.COMMENT -> COMMENT
-        TokenType.ANNOTATION -> ANNOTATION
-        TokenType.IDENT -> IDENT
-        else -> TEXT
+        TokenType.KEYWORD -> keyword
+        TokenType.TYPE -> this.type
+        TokenType.FUNCTION -> function
+        TokenType.STRING -> string
+        TokenType.NUMBER -> number
+        TokenType.COMMENT -> comment
+        TokenType.ANNOTATION -> annotation
+        TokenType.IDENT -> ident
+        else -> text
+    }
+
+    companion object {
+        val Dark = Palette(
+            name = "dark",
+            bg = 0xFF16181D.toInt(),
+            gutterBg = 0xFF16181D.toInt(),
+            gutterLine = 0xFF2A2E36.toInt(),
+            lineNo = 0xFF6F7785.toInt(),
+            lineNoActive = 0xFFD0D4DB.toInt(),
+            text = 0xFFD5D9E0.toInt(),
+            ident = 0xFFDFE2E7.toInt(),
+            keyword = 0xFFC99BF0.toInt(),
+            type = 0xFFE8C27A.toInt(),
+            function = 0xFF7DB7F5.toInt(),
+            string = 0xFFA6D38A.toInt(),
+            number = 0xFFEBA676.toInt(),
+            comment = 0xFF969EAC.toInt(),
+            annotation = 0xFFF28B94.toInt(),
+            lens = 0xFF9CA8BC.toInt(),
+            selection = 0xFF263D66.toInt(),
+            occurrence = 0xFF283040.toInt(),
+            flash = 0xFF283754.toInt(),
+            currentLine = 0xFF1D2026.toInt(),
+            scrollbar = 0x66FFFFFF,
+        )
+
+        val Light = Palette(
+            name = "light",
+            bg = 0xFFFFFFFF.toInt(),
+            gutterBg = 0xFFF6F7F9.toInt(),
+            gutterLine = 0xFFE3E6EB.toInt(),
+            lineNo = 0xFF7F8692.toInt(),
+            lineNoActive = 0xFF1F2328.toInt(),
+            text = 0xFF24292F.toInt(),
+            ident = 0xFF1F2328.toInt(),
+            keyword = 0xFF8A2BB0.toInt(),
+            type = 0xFF8A5300.toInt(),
+            function = 0xFF1F5BBF.toInt(),
+            string = 0xFF1A7230.toInt(),
+            number = 0xFFA8460D.toInt(),
+            comment = 0xFF5F6773.toInt(),
+            annotation = 0xFFB8233A.toInt(),
+            lens = 0xFF55627A.toInt(),
+            selection = 0xFFD3E2FF.toInt(),
+            occurrence = 0xFFE6EBF3.toInt(),
+            flash = 0xFFDCE7FF.toInt(),
+            currentLine = 0xFFF2F5F9.toInt(),
+            scrollbar = 0x55000000,
+        )
     }
 }

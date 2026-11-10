@@ -1,4 +1,5 @@
 <resources>
-    <color name="editor_bg">#FF1B1D23</color>
+    <!-- Matches LightColors.background / DarkColors.background in ui/Theme.kt. -->
+    <color name="window_bg">#FFF6F7F9</color>
     <color name="icon_bg">#FF1B1D23</color>
 </resources>

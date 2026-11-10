@@ -1,7 +1,10 @@
 <resources>
-    <style name="Theme.RepoLens" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@color/editor_bg</item>
+    <!-- Light by default; values-night/themes.xml overrides it so the launch window matches the system mode. -->
+    <style name="Theme.RepoLens" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_bg</item>
+        <item name="android:colorBackground">@color/window_bg</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
     </style>
 </resources>
